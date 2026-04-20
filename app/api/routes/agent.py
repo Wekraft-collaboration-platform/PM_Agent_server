@@ -30,6 +30,9 @@ async def agent_endpoint(request: Request):
 
     thread_id: str = body.get("thread_id") or str(uuid.uuid4())
     user_id: str = body.get("user_id") or body.get("state", {}).get("user_id")
+    project_id: str = body.get("project_id") or body.get("state", {}).get(
+        "project_id"
+    )  # added project_id
     if not user_id:
         raise HTTPException(status_code=400, detail="user_id is required")
     request_type: str = body.get("type", "message")
@@ -40,6 +43,7 @@ async def agent_endpoint(request: Request):
     if request_type == "run":
         graph_input = body.get("state") or {}
         graph_input["user_id"] = user_id  # added user_id
+        graph_input["project_id"] = project_id  # added project_id
         print(f"[/agent] Type=run, graph_input={graph_input}")
 
     elif request_type == "resume":
@@ -72,6 +76,7 @@ async def agent_endpoint(request: Request):
             graph_input = {
                 "messages": [HumanMessage(content=user_message)],
                 "user_id": user_id,  # added user_id......
+                "project_id": project_id,  # added project_id
             }
             print(f"[/agent] Fallback message type, user_message={user_message}")
         else:
