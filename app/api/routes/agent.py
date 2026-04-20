@@ -20,12 +20,18 @@ router = APIRouter(tags=["agent"])
 # Track live streams so we can stop them via /agent/stop
 active_connections: dict[str, asyncio.Event] = {}
 
+
 @router.post("/agent")
 async def agent_endpoint(request: Request):
     body: dict = await request.json()
-    print(f"[/agent] Received request body: {body}")
+    print(
+        f"=====================[/agent] Received request body=======================: {body}"
+    )
 
     thread_id: str = body.get("thread_id") or str(uuid.uuid4())
+    user_id: str = body.get("user_id") or body.get("state", {}).get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id is required")
     request_type: str = body.get("type", "message")
     print(f"[/agent] thread_id={thread_id}, request_type={request_type}")
 
@@ -33,7 +39,7 @@ async def agent_endpoint(request: Request):
 
     if request_type == "run":
         graph_input = body.get("state") or {}
-        graph_input["user_id"] = thread_id  # always inject
+        graph_input["user_id"] = user_id  # added user_id
         print(f"[/agent] Type=run, graph_input={graph_input}")
 
     elif request_type == "resume":
@@ -65,7 +71,7 @@ async def agent_endpoint(request: Request):
         if user_message:
             graph_input = {
                 "messages": [HumanMessage(content=user_message)],
-                "user_id": thread_id,  # ← add this
+                "user_id": user_id,  # added user_id......
             }
             print(f"[/agent] Fallback message type, user_message={user_message}")
         else:
@@ -167,6 +173,7 @@ async def agent_endpoint(request: Request):
             "Connection": "keep-alive",
         },
     )
+
 
 @router.post("/agent/stop")
 async def stop_agent(request: Request):

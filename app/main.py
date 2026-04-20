@@ -4,7 +4,7 @@ from app.api.routes import agent, state, debug
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="MAS- research system", version="1.0.0")
+    app = FastAPI(title="KAYA-wekraft", version="1.0.0")
 
     # Middleware
     app.add_middleware(
