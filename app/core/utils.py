@@ -6,9 +6,9 @@ from langgraph.types import StateSnapshot
 
 
 def message_chunk_event(node_name: str, message_chunk) -> dict:
-    print(
-        f"[message_chunk_event] node={node_name}, msg_id={getattr(message_chunk, 'id', None)}"
-    )
+    # print(
+    #     f"[message_chunk_event] node={node_name}, msg_id={getattr(message_chunk, 'id', None)}"
+    # )
     content = ""
     tool_call_chunks = []
     tool_calls = []
@@ -30,9 +30,9 @@ def message_chunk_event(node_name: str, message_chunk) -> dict:
             {"name": t.get("name"), "args": t.get("args", {}), "id": t.get("id")}
             for t in (getattr(message_chunk, "tool_calls", None) or [])
         ]
-        print(
-            f"[message_chunk_event] content_len={len(content)}, tool_call_chunks={len(tool_call_chunks)}, tool_calls={len(tool_calls)}"
-        )
+        # print(
+        #     f"[message_chunk_event] content_len={len(content)}, tool_call_chunks={len(tool_call_chunks)}, tool_calls={len(tool_calls)}"
+        # )
 
     return {
         "event": "message_chunk",
@@ -51,11 +51,11 @@ def message_chunk_event(node_name: str, message_chunk) -> dict:
 
 
 def checkpoint_event(snapshot) -> dict:
-    print(f"[checkpoint_event] Formatting checkpoint snapshot")
+    # print(f"[checkpoint_event] Formatting checkpoint snapshot")
     data = format_state_snapshot(snapshot)
-    print(
-        f"[checkpoint_event] next={data.get('next')}, keys_in_values={list(data.get('values', {}).keys())}"
-    )
+    # print(
+    #     f"[checkpoint_event] next={data.get('next')}, keys_in_values={list(data.get('values', {}).keys())}"
+    # )
     return {
         "event": "checkpoint",
         "data": json.dumps(data),
@@ -63,7 +63,7 @@ def checkpoint_event(snapshot) -> dict:
 
 
 def interrupt_event(interrupts: list) -> dict:
-    print(f"[interrupt_event] {len(interrupts)} interrupt(s) received")
+    # print(f"[interrupt_event] {len(interrupts)} interrupt(s) received")
     formatted = []
     for i in interrupts:
         # LangGraph 'debug' mode sends interrupts as dicts with 'value' and 'id'
@@ -75,7 +75,7 @@ def interrupt_event(interrupts: list) -> dict:
             value = getattr(i, "value", i)
             interrupt_id = getattr(i, "id", None)
 
-        print(f"[interrupt_event] interrupt value={value}, id={interrupt_id}")
+        # print(f"[interrupt_event] interrupt value={value}, id={interrupt_id}")
         formatted.append({"value": value, "id": interrupt_id})
 
     return {
@@ -101,7 +101,7 @@ def error_event(message: str) -> dict:
 
 
 def format_state_snapshot(snapshot):
-    print(f"[format_state_snapshot] Formatting snapshot type={type(snapshot).__name__}")
+    # print(f"[format_state_snapshot] Formatting snapshot type={type(snapshot).__name__}")
 
     def get_val(obj, key, default=None):
         if isinstance(obj, dict):
@@ -109,9 +109,9 @@ def format_state_snapshot(snapshot):
         return getattr(obj, key, default)
 
     values = get_val(snapshot, "values", {})
-    print(
-        f"[format_state_snapshot] values keys={list(values.keys()) if isinstance(values, dict) else 'not a dict'}"
-    )
+    # print(
+    #     f"[format_state_snapshot] values keys={list(values.keys()) if isinstance(values, dict) else 'not a dict'}"
+    # )
 
     serialized_values = {}
     for key, val in values.items():
@@ -125,13 +125,13 @@ def format_state_snapshot(snapshot):
     config = get_val(snapshot, "config", {})
     metadata = get_val(snapshot, "metadata", {})
     parent_config = get_val(snapshot, "parent_config")
-    print(
-        f"[format_state_snapshot] next={list(next_nodes) if next_nodes else []}, metadata={metadata}"
-    )
+    # print(
+    #     f"[format_state_snapshot] next={list(next_nodes) if next_nodes else []}, metadata={metadata}"
+    # )
 
     interrupts = []
     tasks = get_val(snapshot, "tasks", [])
-    print(f"[format_state_snapshot] {len(tasks)} task(s) found")
+    # print(f"[format_state_snapshot] {len(tasks)} task(s) found")
     for task in tasks:
         task_interrupts = get_val(task, "interrupts", [])
         for interrupt in task_interrupts:
@@ -164,7 +164,7 @@ def _serialize_message(msg) -> dict:
     else:
         type_str = original_type.lower().replace("message", "")
 
-    print(f"[_serialize_message] mapped {original_type} -> {type_str}")
+    # print(f"[_serialize_message] mapped {original_type} -> {type_str}")
 
     base: dict = {
         "type": type_str,

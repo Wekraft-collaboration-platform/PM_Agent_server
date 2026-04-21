@@ -44,12 +44,12 @@ async def agent_endpoint(request: Request):
         graph_input = body.get("state") or {}
         graph_input["user_id"] = user_id  # added user_id
         graph_input["project_id"] = project_id  # added project_id
-        print(f"[/agent] Type=run, graph_input={graph_input}")
+        # print(f"[/agent] Type=run, graph_input={graph_input}")
 
     elif request_type == "resume":
         resume_value = body.get("resume", "cancel")
         graph_input = Command(resume=resume_value)
-        print(f"[/agent] Type=resume, resume_value={resume_value}")
+        # print(f"[/agent] Type=resume, resume_value={resume_value}")
 
     elif request_type == "fork":
         config = body.get("config")
@@ -88,7 +88,7 @@ async def agent_endpoint(request: Request):
     print(f"[/agent] Registered stop_event for thread_id={thread_id}")
 
     async def generate_events() -> AsyncGenerator[dict, None]:
-        print(f"[generate_events] Starting stream for thread_id={thread_id}")
+        # print(f"[generate_events] Starting stream for thread_id={thread_id}")
         try:
             async for chunk in graph.astream(
                 graph_input,
@@ -96,40 +96,41 @@ async def agent_endpoint(request: Request):
                 stream_mode=["debug", "messages", "updates", "custom"],
             ):
                 if stop_event.is_set():
-                    print(
-                        f"[generate_events] Stop event set, breaking stream for thread_id={thread_id}"
-                    )
+                    # print(
+                    #     f"[generate_events] Stop event set, breaking stream for thread_id={thread_id}"
+                    # )
                     break
 
                 chunk_type, chunk_data = chunk
-                print(f"[generate_events] chunk_type={chunk_type}")
+                # print(f"[generate_events] chunk_type={chunk_type}")
 
                 if chunk_type == "debug":
                     debug_type = chunk_data.get("type")
-                    print(f"[generate_events] debug sub-type={debug_type}")
+                    # print(f"[generate_events] debug sub-type={debug_type}")
 
                     if debug_type == "checkpoint":
-                        print(f"[generate_events] Emitting checkpoint event")
+                        # print(f"[generate_events] Emitting checkpoint event")
                         yield checkpoint_event(chunk_data["payload"])
 
                     elif debug_type == "task_result":
                         interrupts = chunk_data["payload"].get("interrupts", [])
                         if interrupts:
-                            print(
-                                f"[generate_events] Emitting interrupt event, interrupts={interrupts}"
-                            )
+                            # print(
+                            #     f"[generate_events] Emitting interrupt event, interrupts={interrupts}"
+                            # )
                             yield interrupt_event(interrupts)
                         else:
-                            print(
-                                f"[generate_events] task_result has no interrupts, skipping"
-                            )
+                            pass
+                            # print(
+                            #     f"[generate_events] task_result has no interrupts, skipping"
+                            # )
 
                 elif chunk_type == "messages":
                     msg, metadata = chunk_data
                     node_name = metadata.get("langgraph_node", "unknown")
-                    print(
-                        f"[generate_events] message chunk from node={node_name}, type={type(msg).__name__}"
-                    )
+                    # print(
+                    #     f"[generate_events] message chunk from node={node_name}, type={type(msg).__name__}"
+                    # )
 
                     # ── GUARD: Skip streaming internal messages from HITL node ──
                     if node_name == "hitl_document":
@@ -141,21 +142,23 @@ async def agent_endpoint(request: Request):
                     if isinstance(msg, AIMessageChunk):
                         has_content = bool(msg.content or msg.tool_call_chunks)
                         if has_content:
-                            print(
-                                f"[generate_events] Emitting message_chunk, content_len={len(msg.content) if isinstance(msg.content, str) else 0}, tool_call_chunks={len(msg.tool_call_chunks or [])}"
-                            )
+                            # print(
+                            #     f"[generate_events] Emitting message_chunk, content_len={len(msg.content) if isinstance(msg.content, str) else 0}, tool_call_chunks={len(msg.tool_call_chunks or [])}"
+                            # )
                             yield message_chunk_event(node_name, msg)
                         else:
-                            print(
-                                f"[generate_events] AIMessageChunk has no content, skipping"
-                            )
+                            pass
+                            # print(
+                            #     f"[generate_events] AIMessageChunk has no content, skipping"
+                            # )
                     else:
-                        print(
-                            f"[generate_events] Non-AI message chunk, skipping: {type(msg).__name__}"
-                        )
+                        pass
+                        # print(
+                        #     f"[generate_events] Non-AI message chunk, skipping: {type(msg).__name__}"
+                        # )
 
                 elif chunk_type == "custom":
-                    print(f"[generate_events] Emitting custom event: {chunk_data}")
+                    # print(f"[generate_events] Emitting custom event: {chunk_data}")
                     yield custom_event(chunk_data)
 
                 else:

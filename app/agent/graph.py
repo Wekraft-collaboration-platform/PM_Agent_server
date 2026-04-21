@@ -1,14 +1,15 @@
 # graph.py — Kaya AI
 
 import os
+import operator
 from datetime import datetime
+from typing import Annotated
 import httpx
 
 from langchain_core.messages import SystemMessage, ToolMessage, HumanMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, MessagesState, START, END
-from langgraph.prebuilt import create_react_agent
 from langgraph.types import interrupt, Send
 from langgraph.checkpoint.memory import InMemorySaver
 from mem0 import MemoryClient
@@ -16,20 +17,32 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-CONVEX_SITE_URL = os.getenv("CONVEX_SITE_URL")
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STATE
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+_RESET = "__RESET__"
+
+
+def _reset_or_add(old: list, new: list) -> list:
+    """If new starts with the reset sentinel, start fresh. Otherwise append."""
+    if new and new[0] == _RESET:
+        return new[1:]  # drop sentinel, return fresh list
+    return old + new
+
+
 class KayaState(MessagesState):
     user_id: str
     thread_id: str
     project_id: str | None
+    _analyst_messages: Annotated[list, _reset_or_add]  # smart reducer
+    _analyst_tool_call_id: str | None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CONVEX READ TOOLS  (used by project_analyst subagent only)
+# CONVEX READ TOOLS  (executed by analyst_tools node only)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -52,8 +65,9 @@ def get_project_tasks(
     Returns a list of tasks with: id, title, status, priority, assignedTo
     (names), startDate, endDate, isBlocked, sprintId.
     """
+    convex_url = os.getenv("CONVEX_SITE_URL")
     print(
-        f"[get_project_tasks] project={project_id} status={status} priority={priority}"
+        f"[get_project_tasks] querying — project={project_id} status={status} priority={priority}"
     )
     payload: dict = {"projectId": project_id}
     if status:
@@ -64,15 +78,14 @@ def get_project_tasks(
         payload["sprintId"] = sprint_id
 
     try:
-        response = httpx.post(
-            f"{CONVEX_SITE_URL}/getProjectTasks",
-            json=payload,
-            timeout=10,
-        )
+        response = httpx.post(f"{convex_url}/getProjectTasks", json=payload, timeout=10)
         response.raise_for_status()
-        data = response.json()
-        tasks = data.get("tasks", [])
-        print(f"[get_project_tasks] ✓ {len(tasks)} tasks returned")
+        tasks = response.json().get("tasks", [])
+        print(f"[get_project_tasks] ✓ {len(tasks)} tasks returned:")
+        for t in tasks:
+            print(
+                f"  · [{t.get('status')}] {t.get('title')} — priority={t.get('priority')} blocked={t.get('isBlocked')}"
+            )
         return {"tasks": tasks, "count": len(tasks)}
     except httpx.HTTPError as e:
         print(f"[get_project_tasks] ✗ ERROR: {e}")
@@ -101,8 +114,9 @@ def get_project_issues(
     Returns a list of issues with: id, title, status, severity, environment,
     type, due_date, taskId, assignedTo (names), sprintId.
     """
+    convex_url = os.getenv("CONVEX_SITE_URL")
     print(
-        f"[get_project_issues] project={project_id} status={status} severity={severity}"
+        f"[get_project_issues] querying — project={project_id} status={status} severity={severity} env={environment}"
     )
     payload: dict = {"projectId": project_id}
     if status:
@@ -116,14 +130,15 @@ def get_project_issues(
 
     try:
         response = httpx.post(
-            f"{CONVEX_SITE_URL}/getProjectIssues",
-            json=payload,
-            timeout=10,
+            f"{convex_url}/getProjectIssues", json=payload, timeout=10
         )
         response.raise_for_status()
-        data = response.json()
-        issues = data.get("issues", [])
-        print(f"[get_project_issues] ✓ {len(issues)} issues returned")
+        issues = response.json().get("issues", [])
+        print(f"[get_project_issues] ✓ {len(issues)} issues returned:")
+        for i in issues:
+            print(
+                f"  · [{i.get('status')}] {i.get('title')} — severity={i.get('severity')} env={i.get('environment')} assigned={i.get('assignedTo')}"
+            )
         return {"issues": issues, "count": len(issues)}
     except httpx.HTTPError as e:
         print(f"[get_project_issues] ✗ ERROR: {e}")
@@ -131,8 +146,10 @@ def get_project_issues(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TOOL DESCRIPTOR (LLM schema only)
+# TOOL DESCRIPTORS  (LLM schema only — intercepted by assign_tool)
 # ─────────────────────────────────────────────────────────────────────────────
+
+
 @tool
 def create_calendar_event(
     project_id: str,
@@ -166,16 +183,16 @@ def ask_project_analyst(query: str, project_id: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HELPER: Convex write (only after approval)
+# HELPER: Convex write (only after HITL approval)
 # ─────────────────────────────────────────────────────────────────────────────
+
+
 async def write_calendar_event_to_convex(payload: dict) -> str:
-    CONVEX_SITE_URL = os.getenv("CONVEX_SITE_URL")
+    convex_url = os.getenv("CONVEX_SITE_URL")
     try:
         async with httpx.AsyncClient() as client:
             response = await client.post(
-                f"{CONVEX_SITE_URL}/createCalendarEvent",
-                json=payload,
-                timeout=10,
+                f"{convex_url}/createCalendarEvent", json=payload, timeout=10
             )
             response.raise_for_status()
             result = response.json()
@@ -188,63 +205,61 @@ async def write_calendar_event_to_convex(payload: dict) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LLM + MEMORY
+# LLM MODELS
 # ─────────────────────────────────────────────────────────────────────────────
+
 _kaya_llm = ChatOpenAI(
     model=os.getenv("KAYA_MODEL", "gpt-4.1-mini"),
     temperature=0.3,
     streaming=True,
 ).bind_tools([create_calendar_event, ask_project_analyst])
 
-# Project analyst — fast, precise, zero hallucination tolerance
+# Analyst LLM — bound to its own read tools only, zero temperature for factual accuracy
 _analyst_llm = ChatOpenAI(
     model=os.getenv("ANALYST_MODEL", "gpt-4.1-nano"),
     temperature=0,
     streaming=True,
-)
+).bind_tools([get_project_tasks, get_project_issues])
 
 _mem0 = MemoryClient()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PROJECT ANALYST SUBAGENT  (ReAct loop with read-only Convex tools)
-# ─────────────────────────────────────────────────────────────────────────────
-
-_analyst_prompt = """You are the Project Analyst — a specialist subagent with read-only access to
-project data (tasks and issues).
- 
-Your job:
-1. Use get_project_tasks and get_project_issues to fetch the data needed to answer the query.
-2. Apply filters (status, priority, severity, environment) to narrow results — don't fetch everything if a filter applies.
-3. Analyse the returned data and produce a clear, structured answer.
- 
-Rules:
-- Always filter by project_id — never fetch data without it.
-- Use multiple tool calls if needed (e.g. fetch blocked tasks AND critical issues separately).
-- Be concise and factual. No fluff. Bullet points for lists, numbers for counts.
-- If the data is empty, say so clearly.
-- Never guess — only report what the data shows."""
-
-project_analyst_subagent = create_react_agent(
-    model=_analyst_llm,
-    tools=[get_project_tasks, get_project_issues],
-    name="project_analyst",
-    prompt=_analyst_prompt,
-)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SYSTEM PROMPT
+# PROMPTS
 # ─────────────────────────────────────────────────────────────────────────────
+
 KAYA_SYSTEM = """You are Kaya, an AI Product Manager agent.
 You help product teams clarify requirements, write PRDs, break down features into tasks,
-prioritize backlogs.
+prioritize backlogs, and surface insights from project data.
 
 Be concise, opinionated, and practical. Ask clarifying questions when needed.
 Always think from the user's perspective and business impact.
 
+When answering questions about tasks, issues, blockers, or sprint progress:
+- Delegate to ask_project_analyst with a clear natural-language query and the active project_id.
+- Wait for the analyst's findings, then synthesise them into a helpful PM-level response.
+
 When creating calendar events:
-- Use the create_calendar_event tool.(no need to ask for confirmation).
-- All events are all-day by default.
-- Use ISO 8601 format for dates (e.g. 2025-04-22T00:00:00)."""
+- Use the create_calendar_event tool (no need to ask for confirmation).
+- make sure to check type (event or milestone).
+- Use ISO 8601 format for dates (e.g. 2025-04-22T00:00:00).
+-if Tool call failed , try again with right parameters."""
+
+_ANALYST_SYSTEM = """You are the Project Analyst — a specialist with read-only access to project data.
+
+Your job:
+1. Use get_project_tasks and get_project_issues to fetch data needed to answer the query.
+2. IMPORTANT: Tools filter server-side. For MULTIPLE statuses make one call per status:
+   - "completed AND not started tasks" → call 1: status="completed", call 2: status="not started"
+3. To get ALL tasks with no filter, call with only project_id and no status.
+4. Make as many tool calls as needed — never stop after one call if the query needs more.
+5. Produce a clear, structured final answer with bullet points and counts.
+
+Rules:
+- Always pass project_id — never fetch without it.
+- Be concise and factual. No fluff.
+- If data is empty for a status, say so explicitly.
+- Always return the whole data , not half information."""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -260,6 +275,7 @@ def kaya(state: KayaState) -> dict:
     last_user_msg = next(
         (m.content for m in reversed(messages) if m.type == "human"), ""
     )
+
     recalled = _mem0.search(last_user_msg, filters={"user_id": user_id})
     memory_block = (
         "\n\nRelevant context from past sessions:\n"
@@ -267,18 +283,19 @@ def kaya(state: KayaState) -> dict:
         if recalled.get("results")
         else ""
     )
-
     project_context = (
-        f"\n\nActive project_id: {project_id}\nAlways pass this project_id when calling any project tool."
+        f"\n\nActive project_id: {project_id}\n"
+        "Always pass this project_id when calling any project tool."
         if project_id
         else ""
     )
 
-    system_content = KAYA_SYSTEM + memory_block + project_context
-    full_messages = [SystemMessage(content=system_content)] + messages
-
+    full_messages = [
+        SystemMessage(content=KAYA_SYSTEM + memory_block + project_context)
+    ] + messages
     response = _kaya_llm.invoke(full_messages)
 
+    # Save to memory only on plain conversation turns (no tool calls)
     if not response.tool_calls and last_user_msg:
         try:
             _mem0.add(
@@ -294,40 +311,79 @@ def kaya(state: KayaState) -> dict:
     return {"messages": [response]}
 
 
-async def project_analyst(tool_call: dict) -> dict:
-    """Runs the project analyst ReAct subagent and returns findings as a ToolMessage."""
+def project_analyst(tool_call: dict) -> dict:
     args = tool_call["args"]
     query = args.get("query", "")
     project_id = args.get("project_id", "")
-
-    print(f"[project_analyst] Starting — query='{query}' project={project_id}")
-
-    result = await project_analyst_subagent.ainvoke(
-        {
-            "messages": [
-                HumanMessage(
-                    content=(f"Project ID: {project_id}\n" f"Question: {query}")
-                )
-            ]
-        }
-    )
-
-    findings = result["messages"][-1].content
-    print(f"[project_analyst] Done — {len(findings)} chars returned")
+    print(f"[project_analyst] Seeding — query='{query}' project={project_id}")
 
     return {
-        "messages": [
-            ToolMessage(
-                content=findings,
-                tool_call_id=tool_call["id"],
-                name="ask_project_analyst",
-            )
+        "_analyst_tool_call_id": tool_call["id"],
+        "_analyst_messages": [
+            _RESET,  # ← tells reducer to wipe old messages
+            {"role": "system", "content": _ANALYST_SYSTEM},
+            {"role": "user", "content": f"Project ID: {project_id}\nQuestion: {query}"},
+        ],
+    }
+
+
+# analyst_think — just appends, no change needed
+def analyst_think(state: KayaState) -> dict:
+    analyst_messages = state.get("_analyst_messages", [])
+    print(f"[analyst_think] Invoking with {len(analyst_messages)} messages")
+
+    response = _analyst_llm.invoke(analyst_messages)
+
+    serialized_tool_calls = [
+        {"id": tc["id"], "name": tc["name"], "args": tc["args"], "type": "tool_call"}
+        for tc in (response.tool_calls or [])
+    ]
+
+    return {
+        "_analyst_messages": [
+            {
+                "role": "assistant",
+                "content": response.content or "",
+                "tool_calls": serialized_tool_calls,
+            }
         ]
     }
 
 
+def analyst_tools(tool_call: dict) -> dict:
+    name = tool_call["name"]
+    args = tool_call["args"]
+    print(f"[analyst_tools] Executing — tool={name}")
+
+    if name == "get_project_tasks":
+        result = get_project_tasks.invoke(args)
+    elif name == "get_project_issues":
+        result = get_project_issues.invoke(args)
+    else:
+        result = {"error": f"Unknown tool: {name}"}
+
+    return {
+        "_analyst_messages": [
+            {
+                "role": "tool",
+                "content": str(result),
+                "tool_call_id": tool_call["id"],
+                "name": name,
+            }
+        ]
+    }
+
+
+def analyst_done(closing_msg: ToolMessage) -> dict:
+    """
+    Receives the closing ToolMessage from analyst_route.
+    Appends it to kaya's messages so kaya can synthesise the final answer.
+    """
+    return {"messages": [closing_msg]}
+
+
 async def tools(tool_call: dict) -> dict:
-    """HITL node for calendar event (named 'tools' so your UI works)"""
+    """HITL node — pauses for user approval before writing the calendar event."""
     args = tool_call["args"]
 
     start_ms = int(datetime.fromisoformat(args["start_iso"]).timestamp() * 1000)
@@ -370,7 +426,6 @@ async def tools(tool_call: dict) -> dict:
         }
 
     result_msg = await write_calendar_event_to_convex(event_payload)
-
     return {
         "messages": [
             ToolMessage(
@@ -388,19 +443,46 @@ async def tools(tool_call: dict) -> dict:
 
 
 def assign_tool(state: KayaState):
+    """Routes Kaya's tool calls to the correct node."""
     last_message = state["messages"][-1]
     if not getattr(last_message, "tool_calls", None):
         return END
 
     sends = []
-    for tool_call in last_message.tool_calls:
-        match tool_call["name"]:
+    for tc in last_message.tool_calls:
+        match tc["name"]:
             case "create_calendar_event":
-                sends.append(Send("tools", tool_call))
+                sends.append(Send("tools", tc))
             case "ask_project_analyst":
-                sends.append(Send("project_analyst", tool_call))
+                sends.append(Send("project_analyst", tc))
 
     return sends if sends else END
+
+
+def analyst_route(state: KayaState):
+    """
+    After analyst_think:
+    - Last message has tool_calls → fan out to analyst_tools (one Send per call)
+    - Last message has no tool_calls → analyst is done → close loop to kaya
+    """
+    analyst_messages = state.get("_analyst_messages", [])
+    last = analyst_messages[-1] if analyst_messages else None
+
+    if last and last.get("tool_calls"):
+        return [Send("analyst_tools", tc) for tc in last["tool_calls"]]
+
+    analyst_tool_call_id = state.get("_analyst_tool_call_id", "unknown")
+    final_content = last.get("content", "No findings.") if last else "No findings."
+    print(f"[analyst_route] Analyst done. Closing tool_call_id={analyst_tool_call_id}")
+
+    return Send(
+        "analyst_done",
+        ToolMessage(
+            content=final_content,
+            tool_call_id=analyst_tool_call_id,
+            name="ask_project_analyst",
+        ),
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -413,14 +495,26 @@ checkpointer = InMemorySaver()
 def build_graph():
     g = StateGraph(KayaState)
 
+    # Core nodes
     g.add_node("kaya", kaya)
     g.add_node("tools", tools)
-    g.add_node("project_analyst", project_analyst)
 
+    # Analyst subgraph nodes (flattened — no create_react_agent)
+    g.add_node("project_analyst", project_analyst)  # seeds _analyst_messages
+    g.add_node("analyst_think", analyst_think)  # LLM decides next step
+    g.add_node("analyst_tools", analyst_tools)  # executes one tool call
+    g.add_node("analyst_done", analyst_done)  # closes loop → kaya
+
+    # Kaya flow
     g.add_edge(START, "kaya")
     g.add_conditional_edges("kaya", assign_tool)
-    g.add_edge("tools", "kaya")  # after calendar event → back to Kaya
-    g.add_edge("project_analyst", "kaya")  # after data insight → back to Kaya
+    g.add_edge("tools", "kaya")
+
+    # Analyst flow
+    g.add_edge("project_analyst", "analyst_think")  # seed → think
+    g.add_conditional_edges("analyst_think", analyst_route)  # think → tools | done
+    g.add_edge("analyst_tools", "analyst_think")  # tool result → think (loop)
+    g.add_edge("analyst_done", "kaya")  # findings → kaya synthesises
 
     return g.compile(checkpointer=checkpointer)
 
