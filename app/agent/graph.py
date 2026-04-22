@@ -145,6 +145,35 @@ def get_project_issues(
         return {"issues": [], "count": 0, "error": str(e)}
 
 
+@tool
+def get_sprint_planner_context(project_id: str) -> dict:
+    """Fetch everything needed to plan a sprint — call this before creating any sprint.
+
+    Returns:
+        project_deadline_ms: project end date as unix ms
+        remaining_days: days left from today to project deadline
+        last_sprint: { name } or null if no sprints yet
+        available_tasks_count: tasks count which is not completed and not in any active/planned sprint
+    """
+    convex_url = os.getenv("CONVEX_SITE_URL")
+    print(f"[get_sprint_planner_context] querying — project={project_id}")
+    try:
+        response = httpx.post(
+            f"{convex_url}/getSprintPlannerContext",
+            json={"projectId": project_id},
+            timeout=10,
+        )
+        response.raise_for_status()
+        ctx = response.json().get("sprintPlannerContext", {})
+        print(
+            f"[get_sprint_planner_context] ✓ remaining_days={ctx.get('remaining_days')} available_tasks={ctx.get('available_tasks_count')} available_issues={ctx.get('available_issues_count')}"
+        )
+        return ctx
+    except httpx.HTTPError as e:
+        print(f"[get_sprint_planner_context] ✗ ERROR: {e}")
+        return {"error": str(e)}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # TOOL DESCRIPTORS  (LLM schema only — intercepted by assign_tool)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -182,6 +211,46 @@ def ask_project_analyst(query: str, project_id: str) -> str:
     return "intercepted"
 
 
+@tool
+def create_sprint(
+    project_id: str,
+    sprint_name: str,
+    sprint_goal: str,
+    start_date: str,
+    end_date: str,
+) -> str:
+    """Create a new sprint for the project.
+
+    Call this ONLY after:
+    1. ask_project_analyst has confirmed Project remaining days and available Task counts.
+    2. The user has provided sprint_name, sprint_goal, start_date and end_date (duration of the sprint)
+
+    duration_days must not exceed the project's remaining days.
+
+    Args:
+        project_id: The active project ID.
+        sprint_name: Unique name for the sprint (e.g. 'sprint-auth').
+        sprint_goal: What this sprint aims to achieve.
+        startDate: Start date of the sprint (YYYY-MM-DD).
+        endDate: End date of the sprint (YYYY-MM-DD).
+    """
+    return "intercepted"
+
+
+@tool
+def add_items_to_sprint(sprint_id: str) -> str:
+    """Trigger the item selection UI so the user can pick tasks for the sprint.
+
+    Call immediately after create_sprint succeeds.
+    The UI shows all available tasks — user selects and confirms.
+    You do NOT need task IDs — the UI and graph handle that.
+
+    Args:
+        sprint_id: The ID returned by create_sprint.
+    """
+    return "intercepted"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPER: Convex write (only after HITL approval)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -204,6 +273,31 @@ async def write_calendar_event_to_convex(payload: dict) -> str:
         return f"❌ Failed to create calendar event: {e}"
 
 
+async def write_sprint_to_convex(payload: dict) -> dict:
+    convex_url = os.getenv("CONVEX_SITE_URL")
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"{convex_url}/createSprint", json=payload, timeout=10
+        )
+        response.raise_for_status()
+        return response.json()
+
+
+async def write_items_to_sprint(sprint_id: str, task_ids: list) -> str:
+    convex_url = os.getenv("CONVEX_SITE_URL")
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{convex_url}/addItemsToSprint",
+                json={"sprintId": sprint_id, "taskIds": task_ids},
+                timeout=10,
+            )
+            response.raise_for_status()
+            return f"✅ Added {len(task_ids)} task(s) to sprint."
+    except httpx.HTTPError as e:
+        return f"❌ Failed to add tasks to sprint: {e}"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # LLM MODELS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -212,14 +306,27 @@ _kaya_llm = ChatOpenAI(
     model=os.getenv("KAYA_MODEL", "gpt-4.1-mini"),
     temperature=0.3,
     streaming=True,
-).bind_tools([create_calendar_event, ask_project_analyst])
+).bind_tools(
+    [
+        create_calendar_event,
+        ask_project_analyst,
+        create_sprint,
+        add_items_to_sprint,
+    ]
+)
 
 # Analyst LLM — bound to its own read tools only, zero temperature for factual accuracy
 _analyst_llm = ChatOpenAI(
-    model=os.getenv("ANALYST_MODEL", "gpt-4.1-nano"),
+    model=os.getenv("ANALYST_MODEL", "gpt-4.1-mini"),
     temperature=0,
     streaming=True,
-).bind_tools([get_project_tasks, get_project_issues])
+).bind_tools(
+    [
+        get_project_tasks,
+        get_project_issues,
+        get_sprint_planner_context,
+    ]
+)
 
 _mem0 = MemoryClient()
 
@@ -228,38 +335,51 @@ _mem0 = MemoryClient()
 # PROMPTS
 # ─────────────────────────────────────────────────────────────────────────────
 
-KAYA_SYSTEM = """You are Kaya, an AI Product Manager agent.
-You help product teams clarify requirements, write PRDs, break down features into tasks,
-prioritize backlogs, and surface insights from project data.
 
+KAYA_SYSTEM = """You are Kaya, an very Intelligent AI Product Manager.
+You help teams with their work, make them understand their tasks , Issues , Help them manage their project.
+ 
 Be concise, opinionated, and practical. Ask clarifying questions when needed.
 Always think from the user's perspective and business impact.
+No need to provide long responses just be concise , accurate and imformative.
+ 
+── Answering questions about tasks / issues / sprint progress ──
+Delegate to ask_project_analyst with a clear query and the active project_id.
+Synthesise the findings into a helpful PM-level response.
+ 
+── Creating calendar events ──
+Use create_calendar_event directly. No confirmation needed.
+event_type must be 'event' or 'milestone'.
+Use ISO 8601 dates (e.g. 2025-04-22T00:00:00).
+If a tool call fails, retry with corrected parameters.
+ 
+── Creating a sprint — follow this EXACT sequence, no skipping ──
+Step 1: Call ask_project_analyst with query="get sprint planning context" and project_id.
+        This returns: remaining_days, project deadline, all previous sprint names, available task count (that can be added to new sprint).
+Step 2: Tell the user what you found. Example:
+        "Your project deadline is in 14 days. There are 8 tasks ready to sprint.
+         Last sprint was 'sprint-ui'. Tell me: sprint name, goal, start date and end date (max end date: <deadline>)."
+Step 3: Wait for the user to reply with sprint name, goal, start date, end date.
+Step 4: Call create_sprint with those exact values. Do NOT call it before the user replies.
+Step 5: Once create_sprint returns a sprint_id, immediately call add_items_to_sprint(sprint_id).
+        Do NOT ask the user for task IDs — the UI handles task selection automatically.
+Step 6: After add_items_to_sprint completes, confirm to the user with the sprint name and task count."""
 
-When answering questions about tasks, issues, blockers, or sprint progress:
-- Delegate to ask_project_analyst with a clear natural-language query and the active project_id.
-- Wait for the analyst's findings, then synthesise them into a helpful PM-level response.
 
-When creating calendar events:
-- Use the create_calendar_event tool (no need to ask for confirmation).
-- make sure to check type (event or milestone).
-- Use ISO 8601 format for dates (e.g. 2025-04-22T00:00:00).
--if Tool call failed , try again with right parameters."""
+_ANALYST_SYSTEM = """You are the Project Analyst — specialist with read-only access to project data.
 
-_ANALYST_SYSTEM = """You are the Project Analyst — a specialist with read-only access to project data.
-
-Your job:
-1. Use get_project_tasks and get_project_issues to fetch data needed to answer the query.
-2. IMPORTANT: Tools filter server-side. For MULTIPLE statuses make one call per status:
-   - "completed AND not started tasks" → call 1: status="completed", call 2: status="not started"
-3. To get ALL tasks with no filter, call with only project_id and no status.
-4. Make as many tool calls as needed — never stop after one call if the query needs more.
-5. Produce a clear, structured final answer with bullet points and counts.
-
+Available tools:
+- get_project_tasks(project_id, status?, priority?, sprint_id?)
+- get_project_issues(project_id, status?, severity?, environment?, sprint_id?)
+- get_sprint_planner_context(project_id)
+ 
 Rules:
-- Always pass project_id — never fetch without it.
-- Be concise and factual. No fluff.
-- If data is empty for a status, say so explicitly.
-- Always return the whole data , not half information."""
+1. Always pass project_id — never fetch without it.
+2. Tools filter server-side. For MULTIPLE statuses make one call per status.
+3. For sprint planning queries, call get_sprint_planner_context.
+4. Make as many tool calls as the query requires — never stop early.
+5. Return concise structured answers: bullet points, counts, no fluff.
+6. If data is empty for a filter, say so explicitly. Never guess."""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -312,26 +432,24 @@ def kaya(state: KayaState) -> dict:
 
 
 def project_analyst(tool_call: dict) -> dict:
+    """Seeds the isolated analyst thread. Resets on every new invocation."""
     args = tool_call["args"]
-    query = args.get("query", "")
-    project_id = args.get("project_id", "")
-    print(f"[project_analyst] Seeding — query='{query}' project={project_id}")
-
     return {
         "_analyst_tool_call_id": tool_call["id"],
         "_analyst_messages": [
-            _RESET,  # ← tells reducer to wipe old messages
+            _RESET,
             {"role": "system", "content": _ANALYST_SYSTEM},
-            {"role": "user", "content": f"Project ID: {project_id}\nQuestion: {query}"},
+            {
+                "role": "user",
+                "content": f"Project ID: {args.get('project_id', '')}\nQuestion: {args.get('query', '')}",
+            },
         ],
     }
 
 
-# analyst_think — just appends, no change needed
 def analyst_think(state: KayaState) -> dict:
+    """Analyst LLM turn — decides next tool or produces final answer."""
     analyst_messages = state.get("_analyst_messages", [])
-    print(f"[analyst_think] Invoking with {len(analyst_messages)} messages")
-
     response = _analyst_llm.invoke(analyst_messages)
 
     serialized_tool_calls = [
@@ -351,14 +469,16 @@ def analyst_think(state: KayaState) -> dict:
 
 
 def analyst_tools(tool_call: dict) -> dict:
+    """Executes one read tool and appends result to analyst thread."""
     name = tool_call["name"]
     args = tool_call["args"]
-    print(f"[analyst_tools] Executing — tool={name}")
 
     if name == "get_project_tasks":
         result = get_project_tasks.invoke(args)
     elif name == "get_project_issues":
         result = get_project_issues.invoke(args)
+    elif name == "get_sprint_planner_context":
+        result = get_sprint_planner_context.invoke(args)
     else:
         result = {"error": f"Unknown tool: {name}"}
 
@@ -375,13 +495,11 @@ def analyst_tools(tool_call: dict) -> dict:
 
 
 def analyst_done(closing_msg: ToolMessage) -> dict:
-    """
-    Receives the closing ToolMessage from analyst_route.
-    Appends it to kaya's messages so kaya can synthesise the final answer.
-    """
+    """Injects analyst's final answer into Kaya's message thread."""
     return {"messages": [closing_msg]}
 
 
+# -----------------------------------TOOLS----------------------------------
 async def tools(tool_call: dict) -> dict:
     """HITL node — pauses for user approval before writing the calendar event."""
     args = tool_call["args"]
@@ -437,6 +555,94 @@ async def tools(tool_call: dict) -> dict:
     }
 
 
+# ── Sprint create — simple write, no interrupt ────────────────────────────────
+
+
+async def sprint_create(tool_call: dict) -> dict:
+    """Creates the sprint directly. Kaya has all info from the user already."""
+    args = tool_call["args"]
+
+    # Convert YYYY-MM-DD dates to unix ms
+    start_ms = int(datetime.strptime(args["start_date"], "%Y-%m-%d").timestamp() * 1000)
+    end_ms = int(datetime.strptime(args["end_date"], "%Y-%m-%d").timestamp() * 1000)
+
+    print(
+        f"[sprint_create] Creating '{args['sprint_name']}' {args['start_date']} → {args['end_date']}"
+    )
+
+    try:
+        result = await write_sprint_to_convex(
+            {
+                "projectId": args["project_id"],
+                "sprintName": args["sprint_name"],
+                "sprintGoal": args["sprint_goal"],
+                "startDate": start_ms,
+                "endDate": end_ms,
+            }
+        )
+        # Convex insertSprint returns the sprint _id directly
+        sprint_id = result.get("sprint")
+        print(f"[sprint_create] ✓ sprint_id={sprint_id}")
+
+        return {
+            "messages": [
+                ToolMessage(
+                    content=f"✅ Sprint '{args['sprint_name']}' created. sprint_id={sprint_id}",
+                    tool_call_id=tool_call["id"],
+                    name="create_sprint",
+                )
+            ]
+        }
+    except httpx.HTTPError as e:
+        return {
+            "messages": [
+                ToolMessage(
+                    content=f"❌ Failed to create sprint: {e}",
+                    tool_call_id=tool_call["id"],
+                    name="create_sprint",
+                )
+            ]
+        }
+
+
+# ── Sprint add items — interrupt waits for UI task selection ─────────────────
+
+
+async def sprint_add_items(tool_call: dict) -> dict:
+    """
+    Fires interrupt() so the UI shows the task selection box.
+    Handles the Convex write internally — Kaya never sees raw task IDs.
+    Resume payload: { task_ids: ["id1", "id2", ...] }
+    """
+    args = tool_call["args"]
+    sprint_id = args["sprint_id"]
+
+    print(f"[sprint_add_items] Interrupting for task selection — sprint_id={sprint_id}")
+
+    selection = interrupt(
+        {
+            "tool": "add_items_to_sprint",
+            "sprint_id": sprint_id,
+            "message": "Select the tasks you want to add to this sprint.",
+        }
+    )
+
+    task_ids = selection.get("task_ids", []) if isinstance(selection, dict) else []
+    print(f"[sprint_add_items] Resumed — tasks={len(task_ids)}")
+
+    result_msg = await write_items_to_sprint(sprint_id, task_ids)
+
+    return {
+        "messages": [
+            ToolMessage(
+                content=result_msg,
+                tool_call_id=tool_call["id"],
+                name="add_items_to_sprint",
+            )
+        ]
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ROUTING
 # ─────────────────────────────────────────────────────────────────────────────
@@ -455,16 +661,16 @@ def assign_tool(state: KayaState):
                 sends.append(Send("tools", tc))
             case "ask_project_analyst":
                 sends.append(Send("project_analyst", tc))
+            case "create_sprint":
+                sends.append(Send("sprint_create", tc))
+            case "add_items_to_sprint":
+                sends.append(Send("sprint_add_items", tc))
 
     return sends if sends else END
 
 
 def analyst_route(state: KayaState):
-    """
-    After analyst_think:
-    - Last message has tool_calls → fan out to analyst_tools (one Send per call)
-    - Last message has no tool_calls → analyst is done → close loop to kaya
-    """
+    """Routes after analyst_think: more tool calls → analyst_tools, done → kaya."""
     analyst_messages = state.get("_analyst_messages", [])
     last = analyst_messages[-1] if analyst_messages else None
 
@@ -473,7 +679,6 @@ def analyst_route(state: KayaState):
 
     analyst_tool_call_id = state.get("_analyst_tool_call_id", "unknown")
     final_content = last.get("content", "No findings.") if last else "No findings."
-    print(f"[analyst_route] Analyst done. Closing tool_call_id={analyst_tool_call_id}")
 
     return Send(
         "analyst_done",
@@ -495,26 +700,34 @@ checkpointer = InMemorySaver()
 def build_graph():
     g = StateGraph(KayaState)
 
-    # Core nodes
+    # Core
     g.add_node("kaya", kaya)
-    g.add_node("tools", tools)
+    g.add_node("tools", tools)  # calendar HITL
 
-    # Analyst subgraph nodes (flattened — no create_react_agent)
-    g.add_node("project_analyst", project_analyst)  # seeds _analyst_messages
+    # Project analyst (flattened ReAct — reads only)
+    g.add_node("project_analyst", project_analyst)  # seeds analyst thread
     g.add_node("analyst_think", analyst_think)  # LLM decides next step
-    g.add_node("analyst_tools", analyst_tools)  # executes one tool call
+    g.add_node("analyst_tools", analyst_tools)  # executes one read tool
     g.add_node("analyst_done", analyst_done)  # closes loop → kaya
+
+    # Sprint write nodes (Kaya owns all writes directly)
+    g.add_node("sprint_create", sprint_create)  # simple write, no interrupt
+    g.add_node(
+        "sprint_add_items", sprint_add_items
+    )  # write + interrupt for task selection
 
     # Kaya flow
     g.add_edge(START, "kaya")
     g.add_conditional_edges("kaya", assign_tool)
     g.add_edge("tools", "kaya")
+    g.add_edge("sprint_create", "kaya")
+    g.add_edge("sprint_add_items", "kaya")
 
     # Analyst flow
-    g.add_edge("project_analyst", "analyst_think")  # seed → think
-    g.add_conditional_edges("analyst_think", analyst_route)  # think → tools | done
-    g.add_edge("analyst_tools", "analyst_think")  # tool result → think (loop)
-    g.add_edge("analyst_done", "kaya")  # findings → kaya synthesises
+    g.add_edge("project_analyst", "analyst_think")
+    g.add_conditional_edges("analyst_think", analyst_route)
+    g.add_edge("analyst_tools", "analyst_think")
+    g.add_edge("analyst_done", "kaya")
 
     return g.compile(checkpointer=checkpointer)
 
