@@ -174,6 +174,49 @@ def get_sprint_planner_context(project_id: str) -> dict:
         return {"error": str(e)}
 
 
+@tool
+def get_scheduler(project_id: str) -> dict:
+    """Fetch the current report scheduler for a project.
+
+    Returns scheduler details if one exists:
+        name: scheduler label
+        frequencyDays: how often the report runs (minimum 3 days)
+        reportType: 'sprints' or 'project'
+        isActive: whether it is currently active
+        lastRunAt: unix ms of last run, or null
+        nextRunAt: unix ms of scheduled next run
+
+    Returns {"exists": false} if no scheduler has been set up yet.
+
+    Args:
+        project_id: The Convex project ID to query.
+    """
+    convex_url = os.getenv("CONVEX_SITE_URL")
+    print(f"[get_scheduler] querying — project={project_id}")
+    try:
+        response = httpx.post(
+            f"{convex_url}/getScheduler",
+            json={"projectId": project_id},
+            timeout=10,
+        )
+        response.raise_for_status()
+        data = response.json()
+        scheduler = data.get("scheduler")
+        if not scheduler:
+            print("[get_scheduler] ✓ no scheduler found")
+            return {"exists": False}
+        print(
+            f"[get_scheduler] ✓ name={scheduler.get('name')} "
+            f"freq={scheduler.get('frequencyDays')}d "
+            f"type={scheduler.get('reportType')} "
+            f"active={scheduler.get('isActive')}"
+        )
+        return {"exists": True, **scheduler}
+    except httpx.HTTPError as e:
+        print(f"[get_scheduler] ✗ ERROR: {e}")
+        return {"exists": False, "error": str(e)}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # TOOL DESCRIPTORS  (LLM schema only — intercepted by assign_tool)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -251,6 +294,25 @@ def add_items_to_sprint(sprint_id: str) -> str:
     return "intercepted"
 
 
+@tool
+def setup_report_scheduler(project_id: str) -> str:
+    """Open the scheduler setup form for the user to configure automated reports.
+
+    Call this when the user wants to:
+    - Set up automated / scheduled reports for a project
+    - Change how often reports are generated
+    - Enable or disable an existing scheduler
+    - Update report type (sprints vs full project)
+
+    The UI will show a form — no need to ask the user for values upfront.
+    Once the user submits the form, the scheduler will be created or updated automatically.
+
+    Args:
+        project_id: The active project ID.
+    """
+    return "intercepted"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPER: Convex write (only after HITL approval)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -298,6 +360,29 @@ async def write_items_to_sprint(sprint_id: str, task_ids: list) -> str:
         return f"❌ Failed to add tasks to sprint: {e}"
 
 
+async def write_scheduler_to_convex(payload: dict) -> str:
+    """Calls createOrUpdateScheduler Convex HTTP action."""
+    convex_url = os.getenv("CONVEX_SITE_URL")
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{convex_url}/createOrUpdateScheduler",
+                json=payload,
+                timeout=10,
+            )
+            response.raise_for_status()
+            result = response.json()
+            return (
+                f"✅ Scheduler saved — "
+                f"name='{payload['name']}' "
+                f"every {payload['frequencyDays']} days "
+                f"type={payload['reportType']} "
+                f"(id: {result.get('id', 'unknown')})"
+            )
+    except httpx.HTTPError as e:
+        return f"❌ Failed to save scheduler: {e}"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # LLM MODELS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -312,6 +397,8 @@ _kaya_llm = ChatOpenAI(
         ask_project_analyst,
         create_sprint,
         add_items_to_sprint,
+        setup_report_scheduler,
+        get_scheduler,
     ]
 )
 
@@ -337,11 +424,17 @@ _mem0 = MemoryClient()
 
 
 KAYA_SYSTEM = """You are Kaya, an very Intelligent AI Product Manager.
-You help teams with their work, make them understand their tasks , Issues , Help them manage their project.
+what you can do -
+1. you help teams with managing their project and ideas.
+2. you look into their tasks / issues / sprints and gather info and inform.
+3. you motivates them and never let them miss their project deadlines.
+4. you understand their needs and create calendar events/ sprints / schedules for them.
+5. you can set up automated report schedulers for projects.
  
 Be concise, opinionated, and practical. Ask clarifying questions when needed.
-Always think from the user's perspective and business impact.
-No need to provide long responses just be concise , accurate and imformative.
+- Always try to repond in clear markdown points where it is necessary and useful.
+ 
+ Here are your External Tools and Other subAgents for your help. usew them whenever you need them.
  
 ── Answering questions about tasks / issues / sprint progress ──
 Delegate to ask_project_analyst with a clear query and the active project_id.
@@ -350,20 +443,27 @@ Synthesise the findings into a helpful PM-level response.
 ── Creating calendar events ──
 Use create_calendar_event directly. No confirmation needed.
 event_type must be 'event' or 'milestone'.
-Use ISO 8601 dates (e.g. 2025-04-22T00:00:00).
+Use ISO 8601 dates (e.g. 2025-04-22T00:00:00) but dont ask from user.Ask only simple date that users can comfotablly give.
 If a tool call fails, retry with corrected parameters.
  
 ── Creating a sprint — follow this EXACT sequence, no skipping ──
 Step 1: Call ask_project_analyst with query="get sprint planning context" and project_id.
         This returns: remaining_days, project deadline, all previous sprint names, available task count (that can be added to new sprint).
-Step 2: Tell the user what you found. Example:
+Step 2: Tell the user what you found in very Imformative and Intelligent way. Example:
         "Your project deadline is in 14 days. There are 8 tasks ready to sprint.
          Last sprint was 'sprint-ui'. Tell me: sprint name, goal, start date and end date (max end date: <deadline>)."
 Step 3: Wait for the user to reply with sprint name, goal, start date, end date.
 Step 4: Call create_sprint with those exact values. Do NOT call it before the user replies.
 Step 5: Once create_sprint returns a sprint_id, immediately call add_items_to_sprint(sprint_id).
         Do NOT ask the user for task IDs — the UI handles task selection automatically.
-Step 6: After add_items_to_sprint completes, confirm to the user with the sprint name and task count."""
+Step 6: After add_items_to_sprint completes, confirm to the user with the sprint name and task count.
+
+── Setting up a report scheduler ──
+Step 1: First always check the scheduler details by calling get_scheduler(project_id).
+Step 2: Then tell user about the scheduler Deatils you got and then call setup_report_scheduler(project_id).
+Step 3: setup_report_scheduler(project_id) whenever the user wants to automate reports.
+        The UI will show a form — do NOT ask the user for name, frequency, or type beforehand.
+Step 4: After the tool returns, confirm the scheduler details back to the user naturally."""
 
 
 _ANALYST_SYSTEM = """You are the Project Analyst — specialist with read-only access to project data.
@@ -556,8 +656,6 @@ async def tools(tool_call: dict) -> dict:
 
 
 # ── Sprint create — simple write, no interrupt ────────────────────────────────
-
-
 async def sprint_create(tool_call: dict) -> dict:
     """Creates the sprint directly. Kaya has all info from the user already."""
     args = tool_call["args"]
@@ -606,8 +704,6 @@ async def sprint_create(tool_call: dict) -> dict:
 
 
 # ── Sprint add items — interrupt waits for UI task selection ─────────────────
-
-
 async def sprint_add_items(tool_call: dict) -> dict:
     """
     Fires interrupt() so the UI shows the task selection box.
@@ -643,6 +739,89 @@ async def sprint_add_items(tool_call: dict) -> dict:
     }
 
 
+# ------------------KAYA READ TOOLS---------------------------------
+async def kaya_read_tools(tool_call: dict) -> dict:
+    """Executes simple read tools directly for Kaya — no subagent needed."""
+    name = tool_call["name"]
+    args = tool_call["args"]
+
+    if name == "get_scheduler":
+        result = get_scheduler.invoke(args)
+    else:
+        result = {"error": f"Unknown read tool: {name}"}
+
+    return {
+        "messages": [
+            ToolMessage(
+                content=str(result),
+                tool_call_id=tool_call["id"],
+                name=name,
+            )
+        ]
+    }
+
+
+# New node — fires interrupt so UI shows the form, then writes on resume
+async def scheduler_setup(tool_call: dict) -> dict:
+    args = tool_call["args"]
+    project_id = args["project_id"]
+
+    # Check for existing scheduler first to pre-fill the form
+    existing_data = None
+    try:
+        result = get_scheduler.invoke({"project_id": project_id})
+        if result.get("exists"):
+            existing_data = {
+                "name": result.get("name"),
+                "frequencyDays": result.get("frequencyDays"),
+                "reportType": result.get("reportType"),
+                "isActive": result.get("isActive"),
+            }
+    except Exception as e:
+        print(f"[scheduler_setup] Could not fetch existing scheduler: {e}")
+
+    # Interrupt — UI shows the scheduler form
+    form_data = interrupt(
+        {
+            "tool": "setup_report_scheduler",
+            "project_id": project_id,
+            "existing_data": existing_data,
+            "message": "Configure your automated report scheduler.",
+        }
+    )
+
+    if not isinstance(form_data, dict) or not form_data.get("name"):
+        return {
+            "messages": [
+                ToolMessage(
+                    content="❌ Scheduler setup cancelled.",
+                    tool_call_id=tool_call["id"],
+                    name="setup_report_scheduler",
+                )
+            ]
+        }
+
+    result_msg = await write_scheduler_to_convex(
+        {
+            "projectId": project_id,
+            "name": form_data["name"],
+            "frequencyDays": form_data["frequencyDays"],
+            "reportType": form_data["reportType"],
+            "isActive": form_data.get("isActive", True),
+        }
+    )
+
+    return {
+        "messages": [
+            ToolMessage(
+                content=result_msg,
+                tool_call_id=tool_call["id"],
+                name="setup_report_scheduler",
+            )
+        ]
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ROUTING
 # ─────────────────────────────────────────────────────────────────────────────
@@ -665,6 +844,10 @@ def assign_tool(state: KayaState):
                 sends.append(Send("sprint_create", tc))
             case "add_items_to_sprint":
                 sends.append(Send("sprint_add_items", tc))
+            case "get_scheduler":
+                sends.append(Send("kaya_read_tools", tc))
+            case "setup_report_scheduler":
+                sends.append(Send("scheduler_setup", tc))
 
     return sends if sends else END
 
@@ -709,6 +892,8 @@ def build_graph():
     g.add_node("analyst_think", analyst_think)  # LLM decides next step
     g.add_node("analyst_tools", analyst_tools)  # executes one read tool
     g.add_node("analyst_done", analyst_done)  # closes loop → kaya
+    g.add_node("kaya_read_tools", kaya_read_tools)
+    g.add_node("scheduler_setup", scheduler_setup)
 
     # Sprint write nodes (Kaya owns all writes directly)
     g.add_node("sprint_create", sprint_create)  # simple write, no interrupt
@@ -722,6 +907,8 @@ def build_graph():
     g.add_edge("tools", "kaya")
     g.add_edge("sprint_create", "kaya")
     g.add_edge("sprint_add_items", "kaya")
+    g.add_edge("kaya_read_tools", "kaya")
+    g.add_edge("scheduler_setup", "kaya")
 
     # Analyst flow
     g.add_edge("project_analyst", "analyst_think")
