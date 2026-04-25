@@ -12,6 +12,7 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, MessagesState, START, END
 from langgraph.types import interrupt, Send
 from langgraph.checkpoint.memory import InMemorySaver
+from langchain_core.runnables import RunnableConfig
 from mem0 import MemoryClient
 from dotenv import load_dotenv
 
@@ -387,20 +388,26 @@ async def write_scheduler_to_convex(payload: dict) -> str:
 # LLM MODELS
 # ─────────────────────────────────────────────────────────────────────────────
 
-_kaya_llm = ChatOpenAI(
-    model=os.getenv("KAYA_MODEL", "gpt-4.1-mini"),
-    temperature=0.3,
+_kaya_tools = [
+    create_calendar_event,
+    ask_project_analyst,
+    create_sprint,
+    add_items_to_sprint,
+    setup_report_scheduler,
+    get_scheduler,
+]
+
+_kaya_llm_fast = ChatOpenAI(
+    model=os.getenv("KAYA_FAST_MODEL", "gpt-4.1-mini"),
+    temperature=0.4,
     streaming=True,
-).bind_tools(
-    [
-        create_calendar_event,
-        ask_project_analyst,
-        create_sprint,
-        add_items_to_sprint,
-        setup_report_scheduler,
-        get_scheduler,
-    ]
-)
+).bind_tools(_kaya_tools)
+
+_kaya_llm_deep = ChatOpenAI(
+    model=os.getenv("KAYA_DEEP_MODEL", "gpt-5.4-mini"),
+    temperature=0.4,
+    streaming=True,
+).bind_tools(_kaya_tools)
 
 # Analyst LLM — bound to its own read tools only, zero temperature for factual accuracy
 _analyst_llm = ChatOpenAI(
@@ -487,7 +494,7 @@ Rules:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def kaya(state: KayaState) -> dict:
+def kaya(state: KayaState, config: RunnableConfig) -> dict:
     user_id = state["user_id"]
     project_id = state.get("project_id")
     messages = state["messages"]
@@ -513,7 +520,12 @@ def kaya(state: KayaState) -> dict:
     full_messages = [
         SystemMessage(content=KAYA_SYSTEM + memory_block + project_context)
     ] + messages
-    response = _kaya_llm.invoke(full_messages)
+
+    model_type = config["configurable"].get("model", "fast")
+    llm = _kaya_llm_deep if model_type == "deep" else _kaya_llm_fast
+
+    print(f"[kaya] invoking {model_type} model")
+    response = llm.invoke(full_messages)
 
     # Save to memory only on plain conversation turns (no tool calls)
     if not response.tool_calls and last_user_msg:

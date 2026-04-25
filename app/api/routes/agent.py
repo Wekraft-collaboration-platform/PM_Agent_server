@@ -36,9 +36,10 @@ async def agent_endpoint(request: Request):
     if not user_id:
         raise HTTPException(status_code=400, detail="user_id is required")
     request_type: str = body.get("type", "message")
-    print(f"[/agent] thread_id={thread_id}, request_type={request_type}")
+    model: str = body.get("model") or "fast"
+    print(f"[/agent] thread_id={thread_id}, request_type={request_type}, model={model}")
 
-    config = {"configurable": {"thread_id": thread_id}}
+    config = {"configurable": {"thread_id": thread_id, "model": model}}
 
     if request_type == "run":
         graph_input = body.get("state") or {}
