@@ -180,6 +180,7 @@ async def agent_endpoint(request: Request):
             "X-Thread-Id": thread_id,
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
         },
     )
 

@@ -17,3 +17,12 @@ docker build -t wekraft-agent .
 docker run -p 8080:8080 --env-file .env wekraft-agent
 
 ## step 4
+
+
+## After deployment (important!)
+
+Go to Google Cloud Console → Cloud Run → your service → Edit & Deploy New Revision
+Under Environment variables, add everything from your .env file (OpenAI keys, LangSmith, etc.)
+Never put secrets in the Docker image.
+
+That’s it! You now have a production-ready agent on Cloud Run.
