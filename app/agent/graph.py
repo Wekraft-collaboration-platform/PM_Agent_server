@@ -450,6 +450,7 @@ Synthesise the findings into a helpful PM-level response.
 ── Creating calendar events ──
 Use create_calendar_event directly. No confirmation needed.
 event_type must be 'event' or 'milestone'.
+Dont ask for ISO dates and Time , all event by default are full day event if user dont specifically mentions time with dates.
 Use ISO 8601 dates (e.g. 2025-04-22T00:00:00) but dont ask from user.Ask only simple date that users can comfotablly give.
 If a tool call fails, retry with corrected parameters.
  
