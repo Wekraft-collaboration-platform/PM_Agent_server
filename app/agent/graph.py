@@ -182,7 +182,7 @@ def get_scheduler(project_id: str) -> dict:
     Returns scheduler details if one exists:
         name: scheduler label
         frequencyDays: how often the report runs (minimum 3 days)
-        reportType: 'sprints' or 'project'
+        recipientEmail: the email address where reports are sent
         isActive: whether it is currently active
         lastRunAt: unix ms of last run, or null
         nextRunAt: unix ms of scheduled next run
@@ -209,7 +209,7 @@ def get_scheduler(project_id: str) -> dict:
         print(
             f"[get_scheduler] ✓ name={scheduler.get('name')} "
             f"freq={scheduler.get('frequencyDays')}d "
-            f"type={scheduler.get('reportType')} "
+            f"email={scheduler.get('recipientEmail')} "
             f"active={scheduler.get('isActive')}"
         )
         return {"exists": True, **scheduler}
@@ -303,7 +303,7 @@ def setup_report_scheduler(project_id: str) -> str:
     - Set up automated / scheduled reports for a project
     - Change how often reports are generated
     - Enable or disable an existing scheduler
-    - Update report type (sprints vs full project)
+    - Set or update the recipient email for reports (optional, defaults to project owner)
 
     The UI will show a form — no need to ask the user for values upfront.
     Once the user submits the form, the scheduler will be created or updated automatically.
@@ -376,8 +376,8 @@ async def write_scheduler_to_convex(payload: dict) -> str:
             return (
                 f"✅ Scheduler saved — "
                 f"name='{payload['name']}' "
-                f"every {payload['frequencyDays']} days "
-                f"type={payload['reportType']} "
+                f"frequency={payload['frequencyDays']} days "
+                f"recipientEmail='{payload.get('recipientEmail', 'owner email')}' "
                 f"(id: {result.get('id', 'unknown')})"
             )
     except httpx.HTTPError as e:
@@ -468,10 +468,9 @@ Step 6: After add_items_to_sprint completes, confirm to the user with the sprint
 
 ── Setting up a report scheduler ──
 Step 1: First always check the scheduler details by calling get_scheduler(project_id).
-Step 2: Then tell user about the scheduler Deatils you got and then call setup_report_scheduler(project_id).
-Step 3: setup_report_scheduler(project_id) whenever the user wants to automate reports.
-        The UI will show a form — do NOT ask the user for name, frequency, or type beforehand.
-Step 4: After the tool returns, confirm the scheduler details back to the user naturally."""
+Step 2: Then tell user about the current scheduler details and call setup_report_scheduler(project_id).
+Step 3: Once setup_report_scheduler returns, confirm the new configuration back to the user.
+Step 4: In your final response, explicitly mention the frequency and the recipient email (e.g., "runs every 5 days and sends reports to team@example.com"). If they didn't specify an email, mention it goes to the project owner by default. Inform them they can always adjust these settings via the form."""
 
 
 _ANALYST_SYSTEM = """You are the Project Analyst — specialist with read-only access to project data.
@@ -787,7 +786,7 @@ async def scheduler_setup(tool_call: dict) -> dict:
             existing_data = {
                 "name": result.get("name"),
                 "frequencyDays": result.get("frequencyDays"),
-                "reportType": result.get("reportType"),
+                "recipientEmail": result.get("recipientEmail"),
                 "isActive": result.get("isActive"),
             }
     except Exception as e:
@@ -814,15 +813,17 @@ async def scheduler_setup(tool_call: dict) -> dict:
             ]
         }
 
-    result_msg = await write_scheduler_to_convex(
-        {
-            "projectId": project_id,
-            "name": form_data["name"],
-            "frequencyDays": form_data["frequencyDays"],
-            "reportType": form_data["reportType"],
-            "isActive": form_data.get("isActive", True),
-        }
-    )
+    # recipientEmail is optional from frontend; if not provided, backend uses owner email
+    payload = {
+        "projectId": project_id,
+        "name": form_data["name"],
+        "frequencyDays": form_data["frequencyDays"],
+        "isActive": form_data.get("isActive", True),
+    }
+    if form_data.get("recipientEmail"):
+        payload["recipientEmail"] = form_data["recipientEmail"]
+
+    result_msg = await write_scheduler_to_convex(payload)
 
     return {
         "messages": [
