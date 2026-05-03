@@ -16,7 +16,11 @@ docker build -t wekraft-agent .
 # Run it (mounts your .env for testing)
 docker run -p 8080:8080 --env-file .env wekraft-agent
 
-## step 4
+# or auto delete when stopped
+docker run --rm -p 8080:8080 --env-file .env wekraft-agent  
+
+## if any error on desktop app
+ taskkill /F /IM "Docker Desktop.exe"
 
 
 ## After deployment (important!)

@@ -30,6 +30,7 @@ async def agent_endpoint(request: Request):
 
     thread_id: str = body.get("thread_id") or str(uuid.uuid4())
     user_id: str = body.get("user_id") or body.get("state", {}).get("user_id")
+    user_name: str = body.get("user_name") or body.get("state", {}).get("user_name")
     project_id: str = body.get("project_id") or body.get("state", {}).get(
         "project_id"
     )  # added project_id
@@ -44,6 +45,7 @@ async def agent_endpoint(request: Request):
     if request_type == "run":
         graph_input = body.get("state") or {}
         graph_input["user_id"] = user_id  # added user_id
+        graph_input["user_name"] = user_name  # added user_name
         graph_input["project_id"] = project_id  # added project_id
         # print(f"[/agent] Type=run, graph_input={graph_input}")
 
@@ -77,6 +79,7 @@ async def agent_endpoint(request: Request):
             graph_input = {
                 "messages": [HumanMessage(content=user_message)],
                 "user_id": user_id,  # added user_id......
+                "user_name": user_name,  # added user_name
                 "project_id": project_id,  # added project_id
             }
             print(f"[/agent] Fallback message type, user_message={user_message}")

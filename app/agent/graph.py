@@ -36,6 +36,7 @@ def _reset_or_add(old: list, new: list) -> list:
 
 class KayaState(MessagesState):
     user_id: str
+    user_name: str | None
     thread_id: str
     project_id: str | None
     _analyst_messages: Annotated[list, _reset_or_add]  # smart reducer
@@ -48,131 +49,132 @@ class KayaState(MessagesState):
 
 
 @tool
-def get_project_tasks(
-    project_id: str,
-    status: str | None = None,
-    priority: str | None = None,
-    sprint_id: str | None = None,
-) -> dict:
-    """Fetch tasks for a project from the database.
-
-    Args:
-        project_id: The Convex project ID to query.
-        status: Optional filter — one of: 'not started', 'inprogress',
-                'reviewing', 'testing', 'completed'.
-        priority: Optional filter — one of: 'high', 'medium', 'low'.
-        sprint_id: Optional sprint ID to scope results to a specific sprint.
-
-    Returns a list of tasks with: id, title, status, priority, assignedTo
-    (names), startDate, endDate, isBlocked, sprintId.
+def get_tasks_summary(project_id: str) -> dict:
+    """Fetch a high-level summary of all tasks including critical and active ones.
+    Useful for getting a quick overview of project health and identifying bottlenecks.
     """
     convex_url = os.getenv("CONVEX_SITE_URL")
-    print(
-        f"[get_project_tasks] querying — project={project_id} status={status} priority={priority}"
-    )
-    payload: dict = {"projectId": project_id}
-    if status:
-        payload["status"] = status
-    if priority:
-        payload["priority"] = priority
-    if sprint_id:
-        payload["sprintId"] = sprint_id
-
-    try:
-        response = httpx.post(f"{convex_url}/getProjectTasks", json=payload, timeout=10)
-        response.raise_for_status()
-        tasks = response.json().get("tasks", [])
-        print(f"[get_project_tasks] ✓ {len(tasks)} tasks returned:")
-        for t in tasks:
-            print(
-                f"  · [{t.get('status')}] {t.get('title')} — priority={t.get('priority')} blocked={t.get('isBlocked')}"
-            )
-        return {"tasks": tasks, "count": len(tasks)}
-    except httpx.HTTPError as e:
-        print(f"[get_project_tasks] ✗ ERROR: {e}")
-        return {"tasks": [], "count": 0, "error": str(e)}
-
-
-@tool
-def get_project_issues(
-    project_id: str,
-    status: str | None = None,
-    severity: str | None = None,
-    environment: str | None = None,
-    sprint_id: str | None = None,
-) -> dict:
-    """Fetch issues for a project from the database.
-
-    Args:
-        project_id: The Convex project ID to query.
-        status: Optional filter — one of: 'not opened', 'opened',
-                'in review', 'reopened', 'closed'.
-        severity: Optional filter — one of: 'critical', 'medium', 'low'.
-        environment: Optional filter — one of: 'local', 'dev', 'staging',
-                     'production'.
-        sprint_id: Optional sprint ID to scope results to a specific sprint.
-
-    Returns a list of issues with: id, title, status, severity, environment,
-    type, due_date, taskId, assignedTo (names), sprintId.
-    """
-    convex_url = os.getenv("CONVEX_SITE_URL")
-    print(
-        f"[get_project_issues] querying — project={project_id} status={status} severity={severity} env={environment}"
-    )
-    payload: dict = {"projectId": project_id}
-    if status:
-        payload["status"] = status
-    if severity:
-        payload["severity"] = severity
-    if environment:
-        payload["environment"] = environment
-    if sprint_id:
-        payload["sprintId"] = sprint_id
-
+    print(f"[get_tasks_summary] querying — project={project_id}")
     try:
         response = httpx.post(
-            f"{convex_url}/getProjectIssues", json=payload, timeout=10
+            f"{convex_url}/getTasksSummary", json={"projectId": project_id}, timeout=10
         )
         response.raise_for_status()
-        issues = response.json().get("issues", [])
-        print(f"[get_project_issues] ✓ {len(issues)} issues returned:")
-        for i in issues:
-            print(
-                f"  · [{i.get('status')}] {i.get('title')} — severity={i.get('severity')} env={i.get('environment')} assigned={i.get('assignedTo')}"
-            )
-        return {"issues": issues, "count": len(issues)}
+        summary = response.json().get("tasksSummary", {})
+        print(f"[get_tasks_summary] ✓ returned")
+        return summary
     except httpx.HTTPError as e:
-        print(f"[get_project_issues] ✗ ERROR: {e}")
-        return {"issues": [], "count": 0, "error": str(e)}
+        print(f"[get_tasks_summary] ✗ ERROR: {e}")
+        return {"error": str(e)}
 
 
 @tool
-def get_sprint_planner_context(project_id: str) -> dict:
-    """Fetch everything needed to plan a sprint — call this before creating any sprint.
-
-    Returns:
-        project_deadline_ms: project end date as unix ms
-        remaining_days: days left from today to project deadline
-        last_sprint: { name } or null if no sprints yet
-        available_tasks_count: tasks count which is not completed and not in any active/planned sprint
+def get_issues_summary(project_id: str) -> dict:
+    """Fetch a summary of all issues, focusing on active and critical ones.
+    Useful for identifying major blockers and critical bugs.
     """
     convex_url = os.getenv("CONVEX_SITE_URL")
-    print(f"[get_sprint_planner_context] querying — project={project_id}")
+    print(f"[get_issues_summary] querying — project={project_id}")
     try:
         response = httpx.post(
-            f"{convex_url}/getSprintPlannerContext",
+            f"{convex_url}/getIssuesSummary", json={"projectId": project_id}, timeout=10
+        )
+        response.raise_for_status()
+        summary = response.json().get("issuesSummary", {})
+        print(f"[get_issues_summary] ✓ returned")
+        return summary
+    except httpx.HTTPError as e:
+        print(f"[get_issues_summary] ✗ ERROR: {e}")
+        return {"error": str(e)}
+
+
+@tool
+def get_member_workload(project_id: str) -> dict:
+    """Returns a detailed breakdown of each team member's current task and issue assignments.
+    Useful for load balancing and seeing who is busy.
+    """
+    convex_url = os.getenv("CONVEX_SITE_URL")
+    print(f"[get_member_workload] querying — project={project_id}")
+    try:
+        response = httpx.post(
+            f"{convex_url}/getMemberWorkloadPYAgent",
             json={"projectId": project_id},
             timeout=10,
         )
         response.raise_for_status()
-        ctx = response.json().get("sprintPlannerContext", {})
-        print(
-            f"[get_sprint_planner_context] ✓ remaining_days={ctx.get('remaining_days')} available_tasks={ctx.get('available_tasks_count')} available_issues={ctx.get('available_issues_count')}"
-        )
-        return ctx
+        members = response.json().get("members", [])
+        print(f"[get_member_workload] ✓ {len(members)} members returned")
+        return {"members": members}
     except httpx.HTTPError as e:
-        print(f"[get_sprint_planner_context] ✗ ERROR: {e}")
+        print(f"[get_member_workload] ✗ ERROR: {e}")
         return {"error": str(e)}
+
+
+@tool
+def get_user_standup(project_id: str, user_id: str) -> dict:
+    """Fetch active tasks and open issues assigned to a specific user.
+    Useful for daily standups and helping the user prioritize their work for today and tomorrow.
+    """
+    convex_url = os.getenv("CONVEX_SITE_URL")
+    print(f"[get_user_standup] querying — project={project_id} user={user_id}")
+    try:
+        response = httpx.post(
+            f"{convex_url}/getUserStandup",
+            json={"projectId": project_id, "userId": user_id},
+            timeout=10,
+        )
+        response.raise_for_status()
+        standup = response.json().get("standup", {})
+        print(f"[get_user_standup] ✓ returned")
+        return standup
+    except httpx.HTTPError as e:
+        print(f"[get_user_standup] ✗ ERROR: {e}")
+        return {"error": str(e)}
+
+
+@tool
+def get_sprint_insights(project_id: str) -> dict:
+    """Fetch comprehensive analytics for all project sprints, including progress metrics and timelines.
+    Useful for understanding sprint velocity and overall progress.
+    """
+    convex_url = os.getenv("CONVEX_SITE_URL")
+    print(f"[get_sprint_insights] querying — project={project_id}")
+    try:
+        response = httpx.post(
+            f"{convex_url}/getSprintInsights",
+            json={"projectId": project_id},
+            timeout=10,
+        )
+        response.raise_for_status()
+        sprints = response.json().get("sprints", [])
+        print(f"[get_sprint_insights] ✓ {len(sprints)} sprints returned")
+        return {"sprints": sprints}
+    except httpx.HTTPError as e:
+        print(f"[get_sprint_insights] ✗ ERROR: {e}")
+        return {"error": str(e)}
+
+
+@tool
+def get_project_insights(project_id: str) -> dict:
+    """Fetch basic project timeline information like deadline and days remaining.
+    Useful for overall project status and tracking against the final deadline.
+    """
+    convex_url = os.getenv("CONVEX_SITE_URL")
+    print(f"[get_project_insights] querying — project={project_id}")
+    try:
+        response = httpx.post(
+            f"{convex_url}/getProjectInsights",
+            json={"projectId": project_id},
+            timeout=10,
+        )
+        response.raise_for_status()
+        insights = response.json().get("projectInsights", {})
+        print(f"[get_project_insights] ✓ returned")
+        return insights
+    except httpx.HTTPError as e:
+        print(f"[get_project_insights] ✗ ERROR: {e}")
+        return {"error": str(e)}
+
 
 
 @tool
@@ -395,6 +397,7 @@ _kaya_tools = [
     add_items_to_sprint,
     setup_report_scheduler,
     get_scheduler,
+    get_user_standup,
 ]
 
 _kaya_llm_fast = ChatOpenAI(
@@ -416,9 +419,11 @@ _analyst_llm = ChatOpenAI(
     streaming=True,
 ).bind_tools(
     [
-        get_project_tasks,
-        get_project_issues,
-        get_sprint_planner_context,
+        get_tasks_summary,
+        get_issues_summary,
+        get_member_workload,
+        get_sprint_insights,
+        get_project_insights,
     ]
 )
 
@@ -430,22 +435,27 @@ _mem0 = MemoryClient()
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-KAYA_SYSTEM = """You are Kaya, an very Intelligent AI Product Manager.
+KAYA_SYSTEM = """You are Kaya, an very Intelligent AI Product Manager and  a specialist in data interpretation.
 what you can do -
 1. you help teams with managing their project and ideas.
-2. you look into their tasks / issues / sprints and gather info and inform.
-3. you motivates them and never let them miss their project deadlines.
-4. you understand their needs and create calendar events/ sprints / schedules for them.
-5. you can set up automated report schedulers for projects.
+2. you look into their tasks / issues / sprints / Team member workloads and gather info and inform.
+3. you understand their needs and create calendar events/ sprints / schedules for them.
+4. you can set up automated report schedulers for projects.
  
 Be concise, opinionated, and practical. Ask clarifying questions when needed.
+- Always greet or refer to the user by their name if provided in the context.
+- Be data-driven: use the counts (total, completed, blocked) to give an executive-level overview.
 - Always try to repond in clear markdown points where it is necessary and useful.
  
  Here are your External Tools and Other subAgents for your help. usew them whenever you need them.
  
-── Answering questions about tasks / issues / sprint progress ──
+── Answering questions about tasks / issues / project status or team members workloads ──
 Delegate to ask_project_analyst with a clear query and the active project_id.
 Synthesise the findings into a helpful PM-level response.
+
+── Preparing daily Standup ──
+Use get_user_standup tool to get the user's daily standup whenever he asks his standup or what he needs to do today.
+Follow the instructions from the tool output to present the standup to the user.
  
 ── Creating calendar events ──
 Use create_calendar_event directly. No confirmation needed.
@@ -455,8 +465,8 @@ Use ISO 8601 dates (e.g. 2025-04-22T00:00:00) but dont ask from user.Ask only si
 If a tool call fails, retry with corrected parameters.
  
 ── Creating a sprint — follow this EXACT sequence, no skipping ──
-Step 1: Call ask_project_analyst with query="get sprint planning context" and project_id.
-        This returns: remaining_days, project deadline, all previous sprint names, available task count (that can be added to new sprint).
+Step 1: Call ask_project_analyst with query="analyze project and sprint status for planning" and project_id.
+        This returns: project timeline, deadlines, and previous sprint performance.
 Step 2: Tell the user what you found in very Imformative and Intelligent way. Example:
         "Your project deadline is in 14 days. There are 8 tasks ready to sprint.
          Last sprint was 'sprint-ui'. Tell me: sprint name, goal, start date and end date (max end date: <deadline>)."
@@ -473,20 +483,22 @@ Step 3: Once setup_report_scheduler returns, confirm the new configuration back 
 Step 4: In your final response, explicitly mention the frequency and the recipient email (e.g., "runs every 5 days and sends reports to team@example.com"). If they didn't specify an email, mention it goes to the project owner by default. Inform them they can always adjust these settings via the form."""
 
 
-_ANALYST_SYSTEM = """You are the Project Analyst — specialist with read-only access to project data.
+_ANALYST_SYSTEM = """You are the Project Analyst — a specialist in data interpretation.
 
 Available tools:
-- get_project_tasks(project_id, status?, priority?, sprint_id?)
-- get_project_issues(project_id, status?, severity?, environment?, sprint_id?)
-- get_sprint_planner_context(project_id)
- 
+- get_tasks_summary: Use for general task health, bottlenecks, and "what's stuck."
+- get_issues_summary: Use for bug tracking, critical blockers, and stability.
+- get_member_workload: Use to see who is doing what and if anyone is overloaded.
+- get_sprint_insights: Use to analyze sprint velocity, progress, and historical performance.
+- get_project_insights: Use for project-wide timeline, deadlines, and tracking.
+
 Rules:
-1. Always pass project_id — never fetch without it.
-2. Tools filter server-side. For MULTIPLE statuses make one call per status.
-3. For sprint planning queries, call get_sprint_planner_context.
-4. Make as many tool calls as the query requires — never stop early.
-5. Return concise structured answers: bullet points, counts, no fluff.
-6. If data is empty for a filter, say so explicitly. Never guess."""
+1. Always pass project_id.
+2. For any "status" or "how are we doing" query, start by getting both tasks and issues summaries.
+3. Use project_insights to answer questions about deadlines or remaining time.
+4. Use sprint_insights to review how previous or current sprints are performing.
+5. Be data-driven: use the counts and stats to provide an executive-level overview.
+6. Return concise structured answers: bullet points, tables, or counts."""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -516,9 +528,26 @@ def kaya(state: KayaState, config: RunnableConfig) -> dict:
         if project_id
         else ""
     )
+    user_id_context = (
+        f"\nYour user_id: {user_id}\nPass this when calling get_user_standup."
+    )
+    user_context = (
+        f"\n\nYou are talking to {state.get('user_name', 'a user')}."
+        if state.get("user_name")
+        else ""
+    )
+    current_date = datetime.now().strftime("%B %d, %Y")
+    date_context = f"\n\nToday is {current_date}."
 
     full_messages = [
-        SystemMessage(content=KAYA_SYSTEM + memory_block + project_context)
+        SystemMessage(
+            content=KAYA_SYSTEM
+            + memory_block
+            + project_context
+            + user_id_context
+            + user_context
+            + date_context
+        )
     ] + messages
 
     model_type = config["configurable"].get("model", "fast")
@@ -585,12 +614,16 @@ def analyst_tools(tool_call: dict) -> dict:
     name = tool_call["name"]
     args = tool_call["args"]
 
-    if name == "get_project_tasks":
-        result = get_project_tasks.invoke(args)
-    elif name == "get_project_issues":
-        result = get_project_issues.invoke(args)
-    elif name == "get_sprint_planner_context":
-        result = get_sprint_planner_context.invoke(args)
+    if name == "get_tasks_summary":
+        result = get_tasks_summary.invoke(args)
+    elif name == "get_issues_summary":
+        result = get_issues_summary.invoke(args)
+    elif name == "get_member_workload":
+        result = get_member_workload.invoke(args)
+    elif name == "get_sprint_insights":
+        result = get_sprint_insights.invoke(args)
+    elif name == "get_project_insights":
+        result = get_project_insights.invoke(args)
     else:
         result = {"error": f"Unknown tool: {name}"}
 
@@ -759,6 +792,8 @@ async def kaya_read_tools(tool_call: dict) -> dict:
 
     if name == "get_scheduler":
         result = get_scheduler.invoke(args)
+    elif name == "get_user_standup":
+        result = get_user_standup.invoke(args)
     else:
         result = {"error": f"Unknown read tool: {name}"}
 
@@ -862,6 +897,8 @@ def assign_tool(state: KayaState):
                 sends.append(Send("kaya_read_tools", tc))
             case "setup_report_scheduler":
                 sends.append(Send("scheduler_setup", tc))
+            case "get_user_standup":
+                sends.append(Send("kaya_read_tools", tc))
 
     return sends if sends else END
 
