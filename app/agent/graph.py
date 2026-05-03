@@ -614,6 +614,16 @@ def analyst_tools(tool_call: dict) -> dict:
     name = tool_call["name"]
     args = tool_call["args"]
 
+    # ── Emit a custom event so the frontend can show this tool card ──────────
+    # metadata.writes collapses parallel same-name nodes to one key, so we
+    # use the custom event channel (which is append-safe) instead.
+    try:
+        from langgraph.config import get_stream_writer
+        write = get_stream_writer()
+        write({"analyst_tool_running": name})
+    except Exception:
+        pass  # Non-critical — UI just won't show this tool card
+
     if name == "get_tasks_summary":
         result = get_tasks_summary.invoke(args)
     elif name == "get_issues_summary":
@@ -637,6 +647,7 @@ def analyst_tools(tool_call: dict) -> dict:
             }
         ]
     }
+
 
 
 def analyst_done(closing_msg: ToolMessage) -> dict:
