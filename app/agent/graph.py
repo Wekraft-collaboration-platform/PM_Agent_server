@@ -176,7 +176,6 @@ def get_project_insights(project_id: str) -> dict:
         return {"error": str(e)}
 
 
-
 @tool
 def get_scheduler(project_id: str) -> dict:
     """Fetch the current report scheduler for a project.
@@ -554,6 +553,16 @@ def kaya(state: KayaState, config: RunnableConfig) -> dict:
     llm = _kaya_llm_deep if model_type == "deep" else _kaya_llm_fast
 
     print(f"[kaya] invoking {model_type} model")
+
+    # ── Emit a custom event for the UI loader ────────────────────────────────
+    try:
+        from langgraph.config import get_stream_writer
+
+        write = get_stream_writer()
+        write({"agent_status": "Kaya is synthesizing an answer..."})
+    except Exception:
+        pass
+
     response = llm.invoke(full_messages)
 
     # Save to memory only on plain conversation turns (no tool calls)
@@ -598,6 +607,15 @@ def analyst_think(state: KayaState) -> dict:
         for tc in (response.tool_calls or [])
     ]
 
+    # ── Emit a custom event for the UI loader ────────────────────────────────
+    try:
+        from langgraph.config import get_stream_writer
+
+        write = get_stream_writer()
+        write({"agent_status": "Project Analyst is analyzing request..."})
+    except Exception:
+        pass
+
     return {
         "_analyst_messages": [
             {
@@ -619,8 +637,22 @@ def analyst_tools(tool_call: dict) -> dict:
     # use the custom event channel (which is append-safe) instead.
     try:
         from langgraph.config import get_stream_writer
+
         write = get_stream_writer()
         write({"analyst_tool_running": name})
+
+        # Mapping tool names to human-friendly status messages
+        status_map = {
+            "get_tasks_summary": "Fetching high-level tasks summary...",
+            "get_issues_summary": "Scanning project issues for bottlenecks...",
+            "get_member_workload": "Checking team workload and assignments...",
+            "get_sprint_insights": "Gathering sprint velocity and progress...",
+            "get_project_insights": "Calculating project timelines and health...",
+            "get_scheduler": "Checking automated report configurations...",
+            "get_user_standup": "Summarizing your active work and priorities...",
+        }
+        status_msg = status_map.get(name, f"Running {name}...")
+        write({"agent_status": status_msg})
     except Exception:
         pass  # Non-critical — UI just won't show this tool card
 
@@ -647,7 +679,6 @@ def analyst_tools(tool_call: dict) -> dict:
             }
         ]
     }
-
 
 
 def analyst_done(closing_msg: ToolMessage) -> dict:
