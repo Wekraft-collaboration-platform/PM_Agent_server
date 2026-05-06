@@ -612,7 +612,7 @@ def analyst_think(state: KayaState) -> dict:
         from langgraph.config import get_stream_writer
 
         write = get_stream_writer()
-        write({"agent_status": "Project Analyst is analyzing request..."})
+        write({"agent_status": "Project Analyst is gathering context..."})
     except Exception:
         pass
 
