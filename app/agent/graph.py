@@ -16,7 +16,9 @@ from langchain_core.runnables import RunnableConfig
 from mem0 import MemoryClient
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=True)
+print(f"[AUTH] Active OpenAI Key: ...{os.getenv('OPENAI_API_KEY')[-4:]}")
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -563,7 +565,12 @@ def kaya(state: KayaState, config: RunnableConfig) -> dict:
     except Exception:
         pass
 
-    response = llm.invoke(full_messages)
+    try:
+        response = llm.invoke(full_messages)
+    except Exception as e:
+        print(f"[ERROR] LLM Call Failed: {str(e)}")
+        raise e
+
 
     # Save to memory only on plain conversation turns (no tool calls)
     if not response.tool_calls and last_user_msg:
