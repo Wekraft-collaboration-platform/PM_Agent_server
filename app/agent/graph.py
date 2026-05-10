@@ -2,9 +2,12 @@
 
 import os
 import operator
+import asyncio
+import threading
 from datetime import datetime
 from typing import Annotated
 import httpx
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 from langchain_core.messages import SystemMessage, ToolMessage, HumanMessage
 from langchain_core.tools import tool
@@ -18,6 +21,9 @@ from dotenv import load_dotenv
 
 load_dotenv(override=True)
 print(f"[AUTH] Active OpenAI Key: ...{os.getenv('OPENAI_API_KEY')[-4:]}")
+
+# Cached once at startup — avoids repeated os.getenv() on every tool call
+_CONVEX_URL: str = os.getenv("CONVEX_SITE_URL", "")
 
 
 
@@ -46,7 +52,21 @@ class KayaState(MessagesState):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CONVEX READ TOOLS  (executed by analyst_tools node only)
+# CONVEX HTTP HELPER — single async entry point with automatic retry
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=5), reraise=True)
+async def _convex_post(endpoint: str, payload: dict) -> dict:
+    """Centralized async Convex HTTP caller. Retries up to 3 times on transient errors."""
+    async with httpx.AsyncClient() as client:
+        r = await client.post(f"{_CONVEX_URL}/{endpoint}", json=payload, timeout=12)
+        r.raise_for_status()
+        return r.json()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONVEX READ TOOLS  (schema bound to LLMs; execution via async nodes below)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -323,67 +343,40 @@ def setup_report_scheduler(project_id: str) -> str:
 
 
 async def write_calendar_event_to_convex(payload: dict) -> str:
-    convex_url = os.getenv("CONVEX_SITE_URL")
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                f"{convex_url}/createCalendarEvent", json=payload, timeout=10
-            )
-            response.raise_for_status()
-            result = response.json()
-            return (
-                f"✅ Calendar event created: '{payload['title']}' "
-                f"(id: {result.get('id', 'unknown')})"
-            )
-    except httpx.HTTPError as e:
+        result = await _convex_post("createCalendarEvent", payload)
+        return (
+            f"✅ Calendar event created: '{payload['title']}' "
+            f"(id: {result.get('id', 'unknown')})"
+        )
+    except Exception as e:
         return f"❌ Failed to create calendar event: {e}"
 
 
 async def write_sprint_to_convex(payload: dict) -> dict:
-    convex_url = os.getenv("CONVEX_SITE_URL")
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            f"{convex_url}/createSprint", json=payload, timeout=10
-        )
-        response.raise_for_status()
-        return response.json()
+    return await _convex_post("createSprint", payload)
 
 
 async def write_items_to_sprint(sprint_id: str, task_ids: list) -> str:
-    convex_url = os.getenv("CONVEX_SITE_URL")
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                f"{convex_url}/addItemsToSprint",
-                json={"sprintId": sprint_id, "taskIds": task_ids},
-                timeout=10,
-            )
-            response.raise_for_status()
-            return f"✅ Added {len(task_ids)} task(s) to sprint."
-    except httpx.HTTPError as e:
+        await _convex_post("addItemsToSprint", {"sprintId": sprint_id, "taskIds": task_ids})
+        return f"✅ Added {len(task_ids)} task(s) to sprint."
+    except Exception as e:
         return f"❌ Failed to add tasks to sprint: {e}"
 
 
 async def write_scheduler_to_convex(payload: dict) -> str:
     """Calls createOrUpdateScheduler Convex HTTP action."""
-    convex_url = os.getenv("CONVEX_SITE_URL")
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                f"{convex_url}/createOrUpdateScheduler",
-                json=payload,
-                timeout=10,
-            )
-            response.raise_for_status()
-            result = response.json()
-            return (
-                f"✅ Scheduler saved — "
-                f"name='{payload['name']}' "
-                f"frequency={payload['frequencyDays']} days "
-                f"recipientEmail='{payload.get('recipientEmail', 'owner email')}' "
-                f"(id: {result.get('id', 'unknown')})"
-            )
-    except httpx.HTTPError as e:
+        result = await _convex_post("createOrUpdateScheduler", payload)
+        return (
+            f"✅ Scheduler saved — "
+            f"name='{payload['name']}' "
+            f"frequency={payload['frequencyDays']} days "
+            f"recipientEmail='{payload.get('recipientEmail', 'owner email')}' "
+            f"(id: {result.get('id', 'unknown')})"
+        )
+    except Exception as e:
         return f"❌ Failed to save scheduler: {e}"
 
 
@@ -516,7 +509,13 @@ def kaya(state: KayaState, config: RunnableConfig) -> dict:
         (m.content for m in reversed(messages) if m.type == "human"), ""
     )
 
-    recalled = _mem0.search(last_user_msg, filters={"user_id": user_id})
+    # Only search memory on fresh user queries — NOT on continuation turns after tool results.
+    # When the last message is a ToolMessage, kaya is synthesizing, not starting a new query.
+    _is_fresh_query = messages and messages[-1].type != "tool"
+    if _is_fresh_query and last_user_msg:
+        recalled = _mem0.search(last_user_msg, filters={"user_id": user_id})
+    else:
+        recalled = {"results": []}
     memory_block = (
         "\n\nRelevant context from past sessions:\n"
         + "\n".join(f"- {m['memory']}" for m in recalled.get("results", []))
@@ -572,18 +571,21 @@ def kaya(state: KayaState, config: RunnableConfig) -> dict:
         raise e
 
 
-    # Save to memory only on plain conversation turns (no tool calls)
+    # Save to memory only on plain conversation turns (no tool calls).
+    # Fire-and-forget via daemon thread — does NOT block the response stream.
     if not response.tool_calls and last_user_msg:
-        try:
-            _mem0.add(
-                [
-                    {"role": "user", "content": last_user_msg},
-                    {"role": "assistant", "content": response.content},
-                ],
-                user_id=user_id,
-            )
-        except Exception as e:
-            print(f"[mem0] failed: {e}")
+        def _save_memory():
+            try:
+                _mem0.add(
+                    [
+                        {"role": "user", "content": last_user_msg},
+                        {"role": "assistant", "content": response.content},
+                    ],
+                    user_id=user_id,
+                )
+            except Exception as e:
+                print(f"[mem0] failed: {e}")
+        threading.Thread(target=_save_memory, daemon=True).start()
 
     return {"messages": [response]}
 
@@ -634,47 +636,52 @@ def analyst_think(state: KayaState) -> dict:
     }
 
 
-def analyst_tools(tool_call: dict) -> dict:
-    """Executes one read tool and appends result to analyst thread."""
+async def analyst_tools(tool_call: dict) -> dict:
+    """Executes one read tool via async HTTP and appends result to analyst thread."""
     name = tool_call["name"]
     args = tool_call["args"]
+    project_id = args.get("project_id", "")
 
     # ── Emit a custom event so the frontend can show this tool card ──────────
-    # metadata.writes collapses parallel same-name nodes to one key, so we
-    # use the custom event channel (which is append-safe) instead.
     try:
         from langgraph.config import get_stream_writer
 
         write = get_stream_writer()
         write({"analyst_tool_running": name})
 
-        # Mapping tool names to human-friendly status messages
         status_map = {
             "get_tasks_summary": "Fetching high-level tasks summary...",
             "get_issues_summary": "Scanning project issues for bottlenecks...",
             "get_member_workload": "Checking team workload and assignments...",
             "get_sprint_insights": "Gathering sprint velocity and progress...",
             "get_project_insights": "Calculating project timelines and health...",
-            "get_scheduler": "Checking automated report configurations...",
-            "get_user_standup": "Summarizing your active work and priorities...",
         }
-        status_msg = status_map.get(name, f"Running {name}...")
-        write({"agent_status": status_msg})
+        write({"agent_status": status_map.get(name, f"Running {name}...")})
     except Exception:
-        pass  # Non-critical — UI just won't show this tool card
+        pass
 
-    if name == "get_tasks_summary":
-        result = get_tasks_summary.invoke(args)
-    elif name == "get_issues_summary":
-        result = get_issues_summary.invoke(args)
-    elif name == "get_member_workload":
-        result = get_member_workload.invoke(args)
-    elif name == "get_sprint_insights":
-        result = get_sprint_insights.invoke(args)
-    elif name == "get_project_insights":
-        result = get_project_insights.invoke(args)
-    else:
-        result = {"error": f"Unknown tool: {name}"}
+    # ── Dispatch to _convex_post directly — no sync tool.invoke() blocking ───
+    try:
+        if name == "get_tasks_summary":
+            data = await _convex_post("getTasksSummary", {"projectId": project_id})
+            result = data.get("tasksSummary", {})
+        elif name == "get_issues_summary":
+            data = await _convex_post("getIssuesSummary", {"projectId": project_id})
+            result = data.get("issuesSummary", {})
+        elif name == "get_member_workload":
+            data = await _convex_post("getMemberWorkloadPYAgent", {"projectId": project_id})
+            result = {"members": data.get("members", [])}
+        elif name == "get_sprint_insights":
+            data = await _convex_post("getSprintInsights", {"projectId": project_id})
+            result = {"sprints": data.get("sprints", [])}
+        elif name == "get_project_insights":
+            data = await _convex_post("getProjectInsights", {"projectId": project_id})
+            result = data.get("projectInsights", {})
+        else:
+            result = {"error": f"Unknown tool: {name}"}
+    except Exception as e:
+        print(f"[analyst_tools] ✗ {name} ERROR: {e}")
+        result = {"error": str(e)}
 
     return {
         "_analyst_messages": [
@@ -835,16 +842,26 @@ async def sprint_add_items(tool_call: dict) -> dict:
 
 # ------------------KAYA READ TOOLS---------------------------------
 async def kaya_read_tools(tool_call: dict) -> dict:
-    """Executes simple read tools directly for Kaya — no subagent needed."""
+    """Executes simple read tools directly for Kaya via async HTTP — no subagent needed."""
     name = tool_call["name"]
     args = tool_call["args"]
 
-    if name == "get_scheduler":
-        result = get_scheduler.invoke(args)
-    elif name == "get_user_standup":
-        result = get_user_standup.invoke(args)
-    else:
-        result = {"error": f"Unknown read tool: {name}"}
+    try:
+        if name == "get_scheduler":
+            data = await _convex_post("getScheduler", {"projectId": args.get("project_id")})
+            scheduler = data.get("scheduler")
+            result = {"exists": False} if not scheduler else {"exists": True, **scheduler}
+        elif name == "get_user_standup":
+            data = await _convex_post(
+                "getUserStandup",
+                {"projectId": args.get("project_id"), "userId": args.get("user_id")},
+            )
+            result = data.get("standup", {})
+        else:
+            result = {"error": f"Unknown read tool: {name}"}
+    except Exception as e:
+        print(f"[kaya_read_tools] ✗ {name} ERROR: {e}")
+        result = {"error": str(e)}
 
     return {
         "messages": [
@@ -865,13 +882,14 @@ async def scheduler_setup(tool_call: dict) -> dict:
     # Check for existing scheduler first to pre-fill the form
     existing_data = None
     try:
-        result = get_scheduler.invoke({"project_id": project_id})
-        if result.get("exists"):
+        data = await _convex_post("getScheduler", {"projectId": project_id})
+        scheduler = data.get("scheduler")
+        if scheduler:
             existing_data = {
-                "name": result.get("name"),
-                "frequencyDays": result.get("frequencyDays"),
-                "recipientEmail": result.get("recipientEmail"),
-                "isActive": result.get("isActive"),
+                "name": scheduler.get("name"),
+                "frequencyDays": scheduler.get("frequencyDays"),
+                "recipientEmail": scheduler.get("recipientEmail"),
+                "isActive": scheduler.get("isActive"),
             }
     except Exception as e:
         print(f"[scheduler_setup] Could not fetch existing scheduler: {e}")
