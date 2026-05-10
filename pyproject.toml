@@ -1,3 +1,6 @@
+[tool.poetry]
+package-mode = false
+
 [project]
 name = "we-agent"
 version = "0.1.0"
@@ -6,9 +9,6 @@ authors = [
     {name = "ronitrai27",email = "ronitrai1237@gmail.com"}
 ]
 requires-python = ">=3.12,<4.0"
-packages = [
-    { include = "app" },
-]
 dependencies = [
     "fastapi (>=0.136.0,<0.137.0)",
     "uvicorn[standard] (>=0.44.0,<0.45.0)",
