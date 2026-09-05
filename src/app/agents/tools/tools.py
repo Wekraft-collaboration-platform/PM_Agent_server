@@ -63,8 +63,24 @@ def search_user_memory(user_id: str, query: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# READ TOOLS (@tool)
+# READ & ANALYTICS TOOLS (@tool)
 # ─────────────────────────────────────────────────────────────────────────────
+
+@tool
+def get_user_standup(project_id: str, user_id: str) -> dict:
+    """Fetch active tasks and open issues assigned to a specific user.
+    Useful for daily standups and helping the user prioritize their work for today and tomorrow.
+    """
+    print(f"[get_user_standup] querying — project={project_id} user={user_id}")
+    try:
+        data = convex_post_sync("getUserStandup", {"projectId": project_id, "userId": user_id})
+        standup = data.get("standup", {})
+        print(f"[get_user_standup] ✓ returned")
+        return standup
+    except Exception as e:
+        print(f"[get_user_standup] ✗ ERROR: {e}")
+        return {"error": str(e)}
+
 
 @tool
 def get_tasks_summary(project_id: str) -> dict:
@@ -115,22 +131,6 @@ def get_member_workload(project_id: str) -> dict:
 
 
 @tool
-def get_user_standup(project_id: str, user_id: str) -> dict:
-    """Fetch active tasks and open issues assigned to a specific user.
-    Useful for daily standups and helping the user prioritize their work for today and tomorrow.
-    """
-    print(f"[get_user_standup] querying — project={project_id} user={user_id}")
-    try:
-        data = convex_post_sync("getUserStandup", {"projectId": project_id, "userId": user_id})
-        standup = data.get("standup", {})
-        print(f"[get_user_standup] ✓ returned")
-        return standup
-    except Exception as e:
-        print(f"[get_user_standup] ✗ ERROR: {e}")
-        return {"error": str(e)}
-
-
-@tool
 def get_sprint_insights(project_id: str) -> dict:
     """Fetch comprehensive analytics for all project sprints, including progress metrics and timelines.
     Useful for understanding sprint velocity and overall progress.
@@ -175,10 +175,7 @@ def create_calendar_event(
     start_iso: str,
     end_iso: str,
 ) -> str:
-    """Create a calendar event for a project.
-    event_type must be one of: event, milestone.
-    start_iso and end_iso must be ISO 8601 strings.
-    """
+    """Create a calendar event for a project."""
     return "intercepted"
 
 
@@ -208,19 +205,13 @@ def setup_report_scheduler(project_id: str) -> str:
 
 @tool
 def bulk_create_tasks(project_id: str) -> str:
-    """Bulk create tasks extracted from uploaded PRDs / documents.
-    Agent specifies 4 key fields per task: title, description, priority, type.
-    Status defaults to 'not started' and estimation to today-tomorrow.
-    """
+    """Bulk create tasks extracted from uploaded PRDs / documents."""
     return "intercepted"
 
 
 @tool
 def bulk_create_issues(project_id: str) -> str:
-    """Bulk create issues extracted from uploaded documents or error logs.
-    Agent specifies 4 key fields per issue: title, description, environment, severity.
-    Status defaults to 'not opened' and due_date to day after tomorrow.
-    """
+    """Bulk create issues extracted from uploaded documents or error logs."""
     return "intercepted"
 
 
@@ -232,10 +223,7 @@ async def write_calendar_event_to_convex(payload: dict) -> str:
     """Actual HTTP call to Convex for calendar creation after HITL approval."""
     try:
         result = await convex_post_async("createCalendarEvent", payload)
-        return (
-            f"✅ Calendar event created: '{payload.get('title')}' "
-            f"(id: {result.get('id', 'unknown')})"
-        )
+        return f"✅ Calendar event created: '{payload.get('title')}' (id: {result.get('id', 'unknown')})"
     except Exception as e:
         return f"❌ Failed to create calendar event: {e}"
 
@@ -258,12 +246,7 @@ async def write_scheduler_to_convex(payload: dict) -> str:
     """Actual HTTP call to Convex for scheduler configuration after HITL approval."""
     try:
         result = await convex_post_async("createOrUpdateScheduler", payload)
-        return (
-            f"✅ Scheduler saved — "
-            f"name='{payload.get('name')}' "
-            f"frequency={payload.get('frequencyDays')} days "
-            f"(id: {result.get('id', 'unknown')})"
-        )
+        return f"✅ Scheduler saved (id: {result.get('id', 'unknown')})"
     except Exception as e:
         return f"❌ Failed to save scheduler: {e}"
 
@@ -286,27 +269,33 @@ async def write_bulk_issues_to_convex(payload: dict) -> str:
         return f"❌ Failed to bulk create issues: {e}"
 
 
-# Exported Agent Toolsets
-KAYA_TOOLS = [
+# ─────────────────────────────────────────────────────────────────────────────
+# EXPORTED TOOLSETS (Categorized by Pure Concern)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# All Mutation / Write / HITL Tools
+DBWRITE_TOOLS = [
     search_user_memory,
     create_calendar_event,
-    get_user_standup,
     setup_report_scheduler,
-]
-
-ANALYST_TOOLS = [
-    get_tasks_summary,
-    get_issues_summary,
-    get_member_workload,
-    get_project_insights,
     bulk_create_tasks,
     bulk_create_issues,
 ]
 
+# All Read-Only Analytics & Insights Tools
+ANALYST_TOOLS = [
+    get_user_standup,
+    get_tasks_summary,
+    get_issues_summary,
+    get_member_workload,
+    get_project_insights,
+]
+
+# Sprint Management Tools
 SPRINT_TOOLS = [
     get_sprint_insights,
     create_sprint,
     add_items_to_sprint,
 ]
 
-ALL_TOOLS = KAYA_TOOLS + ANALYST_TOOLS + SPRINT_TOOLS
+ALL_TOOLS = DBWRITE_TOOLS + ANALYST_TOOLS + SPRINT_TOOLS

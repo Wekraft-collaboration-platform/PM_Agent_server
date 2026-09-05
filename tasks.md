@@ -13,15 +13,16 @@ This checklist details the step-by-step tasks to implement the Semantic Cache, R
   - Skip cache lookup if query is a greeting or file upload.
 
 
-- [ ] **Task 2: Toolset Reorganization (`DBwrite_tools`, `analyst_tools`, `sprint_tools`)**
+- [x] **Task 2: Toolset Reorganization (`DBWRITE_TOOLS`, `ANALYST_TOOLS`, `SPRINT_TOOLS`)**
   - Rename `KAYA_TOOLS` -> `DBWRITE_TOOLS` (`search_user_memory`, `create_calendar_event`, `get_user_standup`, `setup_report_scheduler`).
   - Keep `ANALYST_TOOLS` (`get_tasks_summary`, `get_issues_summary`, `get_member_workload`, `get_project_insights`, `bulk_create_tasks`, `bulk_create_issues`).
   - Keep `SPRINT_TOOLS` (`get_sprint_insights`, `create_sprint`, `add_items_to_sprint`).
 
-- [ ] **Task 3: Router & Pydantic `SupervisorDecision` Schema**
+- [x] **Task 3: Router & Pydantic `SupervisorDecision` Schema (`kaya_graph.py`)**
   - Implement `SupervisorDecision(BaseModel)` with `actions: List[str]` and `reasoning: str`.
-  - Configure Groq router model (`gpt-120b`).
-  - Build supervisor routing node that decides which sub-agents (`db_write_agent`, `analyst_agent`, `sprint_agent`, or direct `kaya_user_facing_agent`) to execute.
+  - Configure single Groq router model (`llama-3.3-70b-versatile`).
+  - Build router decision logic (`route_user_request`) that prints clean router results.
+
 
 - [ ] **Task 4: Multi-Agent Graph Skeleton (`agent/src/app/agents/graph.py`)**
   - Build `db_write_agent` node.

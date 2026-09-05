@@ -1,6 +1,6 @@
 from app.agents.tools.tools import (
     ALL_TOOLS,
-    KAYA_TOOLS,
+    DBWRITE_TOOLS,
     ANALYST_TOOLS,
     SPRINT_TOOLS,
     search_user_memory,
@@ -28,7 +28,7 @@ from app.agents.tools.tools import (
 
 __all__ = [
     "ALL_TOOLS",
-    "KAYA_TOOLS",
+    "DBWRITE_TOOLS",
     "ANALYST_TOOLS",
     "SPRINT_TOOLS",
     "search_user_memory",
