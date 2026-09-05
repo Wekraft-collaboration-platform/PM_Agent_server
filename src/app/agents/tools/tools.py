@@ -39,6 +39,30 @@ def convex_post_sync(endpoint: str, payload: dict) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# MEMORY TOOLS (@tool)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@tool
+def search_user_memory(user_id: str, query: str) -> dict:
+    """Search long-term memory for user preferences, past choices, and user context.
+    Use this whenever the user asks about their personal preferences, past interactions, or stored facts.
+    """
+    print(f"[search_user_memory] Searching Mem0 for user_id={user_id}, query='{query}'")
+    try:
+        mem0_key = os.getenv("MEM0_API_KEY")
+        if not mem0_key:
+            return {"memories": [], "note": "MEM0_API_KEY not set"}
+        from mem0 import MemoryClient
+        client = MemoryClient(api_key=mem0_key)
+        results = client.search(query, user_id=user_id)
+        print(f"[search_user_memory] ✓ Found {len(results)} memory entries")
+        return {"memories": results}
+    except Exception as e:
+        print(f"[search_user_memory] ✗ Error searching Mem0: {e}")
+        return {"memories": [], "error": str(e)}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # READ TOOLS (@tool)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -138,39 +162,6 @@ def get_project_insights(project_id: str) -> dict:
         return {"error": str(e)}
 
 
-@tool
-def get_scheduler(project_id: str) -> dict:
-    """Fetch the current report scheduler for a project.
-
-    Returns scheduler details if one exists:
-        name: scheduler label
-        frequencyDays: how often the report runs (minimum 3 days)
-        recipientEmail: the email address where reports are sent
-        isActive: whether it is currently active
-        lastRunAt: unix ms of last run, or null
-        nextRunAt: unix ms of scheduled next run
-
-    Returns {"exists": false} if no scheduler has been set up yet.
-    """
-    print(f"[get_scheduler] querying — project={project_id}")
-    try:
-        data = convex_post_sync("getScheduler", {"projectId": project_id})
-        scheduler = data.get("scheduler")
-        if not scheduler:
-            print("[get_scheduler] ✓ no scheduler found")
-            return {"exists": False}
-        print(
-            f"[get_scheduler] ✓ name={scheduler.get('name')} "
-            f"freq={scheduler.get('frequencyDays')}d "
-            f"email={scheduler.get('recipientEmail')} "
-            f"active={scheduler.get('isActive')}"
-        )
-        return {"exists": True, **scheduler}
-    except Exception as e:
-        print(f"[get_scheduler] ✗ ERROR: {e}")
-        return {"exists": False, "error": str(e)}
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # WRITE / HITL SCHEMA DESCRIPTOR TOOLS (@tool)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -217,7 +208,13 @@ def add_items_to_sprint(sprint_id: str) -> str:
 
 @tool
 def setup_report_scheduler(project_id: str) -> str:
-    """Open the scheduler setup form for the user to configure automated reports."""
+    """Open or view the report scheduler form for a project.
+
+    Call this when the user wants to:
+    - View the current report scheduler configuration (if active)
+    - Set up or update automated reports for a project
+    - Enable or disable an existing scheduler or change report frequency/recipients
+    """
     return "intercepted"
 
 
@@ -268,9 +265,9 @@ async def write_scheduler_to_convex(payload: dict) -> str:
 
 # Exported Agent Toolsets
 KAYA_TOOLS = [
-    get_user_standup,
+    search_user_memory,
     create_calendar_event,
-    get_scheduler,
+    get_user_standup,
     setup_report_scheduler,
 ]
 
