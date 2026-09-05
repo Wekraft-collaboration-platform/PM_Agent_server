@@ -194,20 +194,6 @@ def create_calendar_event(
 
 
 @tool
-def ask_project_analyst(query: str, project_id: str) -> str:
-    """Delegate a data question to the Project Analyst subagent.
-
-    The analyst has read access to the project's tasks and issues and can answer questions like:
-    - "What tasks are blocked?"
-    - "Show me all critical issues in production"
-    - "Which high-priority tasks are still not started?"
-    - "Which team member has the most open issues?"
-    - "Summarise sprint progress"
-    """
-    return "intercepted"
-
-
-@tool
 def create_sprint(
     project_id: str,
     sprint_name: str,
@@ -216,10 +202,7 @@ def create_sprint(
     end_date: str,
 ) -> str:
     """Create a new sprint for the project.
-
-    Call this ONLY after:
-    1. ask_project_analyst has confirmed Project remaining days and available Task counts.
-    2. The user has provided sprint_name, sprint_goal, start_date and end_date (YYYY-MM-DD).
+    The user must provide sprint_name, sprint_goal, start_date and end_date (YYYY-MM-DD).
     """
     return "intercepted"
 
@@ -227,23 +210,14 @@ def create_sprint(
 @tool
 def add_items_to_sprint(sprint_id: str) -> str:
     """Trigger the item selection UI so the user can pick tasks for the sprint.
-
     Call immediately after create_sprint succeeds.
-    The UI shows all available tasks — user selects and confirms.
     """
     return "intercepted"
 
 
 @tool
 def setup_report_scheduler(project_id: str) -> str:
-    """Open the scheduler setup form for the user to configure automated reports.
-
-    Call this when the user wants to:
-    - Set up automated / scheduled reports for a project
-    - Change how often reports are generated
-    - Enable or disable an existing scheduler
-    - Set or update the recipient email for reports
-    """
+    """Open the scheduler setup form for the user to configure automated reports."""
     return "intercepted"
 
 
@@ -292,18 +266,25 @@ async def write_scheduler_to_convex(payload: dict) -> str:
         return f"❌ Failed to save scheduler: {e}"
 
 
-# Exported toolsets
-ALL_TOOLS = [
+# Exported Agent Toolsets
+KAYA_TOOLS = [
+    get_user_standup,
+    create_calendar_event,
+    get_scheduler,
+    setup_report_scheduler,
+]
+
+ANALYST_TOOLS = [
     get_tasks_summary,
     get_issues_summary,
     get_member_workload,
-    get_user_standup,
-    get_sprint_insights,
     get_project_insights,
-    get_scheduler,
-    create_calendar_event,
-    ask_project_analyst,
+]
+
+SPRINT_TOOLS = [
+    get_sprint_insights,
     create_sprint,
     add_items_to_sprint,
-    setup_report_scheduler,
 ]
+
+ALL_TOOLS = KAYA_TOOLS + ANALYST_TOOLS + SPRINT_TOOLS

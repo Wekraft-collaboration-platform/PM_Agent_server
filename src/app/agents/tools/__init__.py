@@ -1,5 +1,8 @@
 from app.agents.tools.tools import (
     ALL_TOOLS,
+    KAYA_TOOLS,
+    ANALYST_TOOLS,
+    SPRINT_TOOLS,
     get_tasks_summary,
     get_issues_summary,
     get_member_workload,
@@ -8,7 +11,6 @@ from app.agents.tools.tools import (
     get_project_insights,
     get_scheduler,
     create_calendar_event,
-    ask_project_analyst,
     create_sprint,
     add_items_to_sprint,
     setup_report_scheduler,
@@ -22,6 +24,9 @@ from app.agents.tools.tools import (
 
 __all__ = [
     "ALL_TOOLS",
+    "KAYA_TOOLS",
+    "ANALYST_TOOLS",
+    "SPRINT_TOOLS",
     "get_tasks_summary",
     "get_issues_summary",
     "get_member_workload",
@@ -30,7 +35,6 @@ __all__ = [
     "get_project_insights",
     "get_scheduler",
     "create_calendar_event",
-    "ask_project_analyst",
     "create_sprint",
     "add_items_to_sprint",
     "setup_report_scheduler",
