@@ -4,14 +4,9 @@ import asyncio
 import httpx
 from typing import Tuple, Dict, Any, Optional
 from dotenv import load_dotenv
+from app.core.utils import is_greeting_query
 
 load_dotenv()
-
-GREETINGS_PATTERNS = [
-    r"\bhi\b", r"\bhello\b", r"\bhey\b", r"\bgood morning\b", r"\bgood afternoon\b",
-    r"\bgood evening\b", r"\bgreetings\b", r"\bhowdy\b", r"\bsup\b", r"\byo\b",
-    r"\bnamaste\b", r"\bhola\b"
-]
 
 # PII Regex Patterns (EXCLUDING email address)
 PII_PATTERNS = {
@@ -68,8 +63,8 @@ class InputGuardrails:
                     "is_short_query": False,
                 }
 
-        # Check greetings
-        is_greeting = any(re.search(pat, lowered) for pat in GREETINGS_PATTERNS)
+        # Check greetings using centralized is_greeting_query
+        is_greeting = is_greeting_query(text)
         is_short_query = len(words) < 4
 
         return {
@@ -89,7 +84,6 @@ class InputGuardrails:
         """
         groq_key = os.getenv("GROQ_API_KEY", self.groq_api_key)
         if not groq_key:
-            # Fallback if no GROQ key configured
             return True, 0.0, "Groq API key not set; skipping LLM guardrail check."
 
         url = "https://api.groq.com/openai/v1/chat/completions"
@@ -120,7 +114,6 @@ class InputGuardrails:
                     result = resp.json()
                     raw_content = result["choices"][0]["message"]["content"]
                     
-                    # Extract risk_score from LLM output
                     import json
                     try:
                         parsed = json.loads(raw_content)
@@ -129,14 +122,12 @@ class InputGuardrails:
                         reason = parsed.get("reason", "Passed LLM safeguard evaluation.")
                         return is_safe, risk_score, reason
                     except Exception:
-                        # Fallback parsing
                         if "unsafe" in raw_content.lower() or "risk_score: 0.9" in raw_content or "risk_score: 1" in raw_content:
                             return False, 0.9, raw_content
                         return True, 0.0, "Passed safeguard evaluation."
                 else:
                     return True, 0.0, f"Groq HTTP status {resp.status_code}, allowed."
         except Exception as e:
-            # On timeout or network error, fail-open gracefully to keep latency low
             return True, 0.0, f"Groq LLM check bypassed due to error: {e}"
 
     async def run_input_guardrails(self, text: str) -> Dict[str, Any]:
@@ -144,7 +135,6 @@ class InputGuardrails:
         Runs Layer 1 & Layer 2 in parallel, followed by Layer 3 Groq LLM check.
         Logs: 'Passed user query from 3 steps.' on success.
         """
-        # Step 1 & Step 2 in parallel
         redacted_text = self.layer1_pii_redaction(text)
         layer2_res = self.layer2_regex_and_greetings(redacted_text)
 
@@ -158,7 +148,6 @@ class InputGuardrails:
                 "risk_score": 1.0,
             }
 
-        # Step 3: Layer 3 Groq LLM Guardrail
         is_safe_llm, risk_score, llm_reason = await self.validate_layer2_groq_llm(redacted_text)
 
         if not is_safe_llm or risk_score > 0.8:
@@ -171,7 +160,6 @@ class InputGuardrails:
                 "risk_score": risk_score,
             }
 
-        # Successful pass through all 3 steps
         print("Passed user query from 3 steps.")
 
         return {

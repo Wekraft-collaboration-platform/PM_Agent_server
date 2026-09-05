@@ -178,8 +178,6 @@ def create_calendar_event(
     """Create a calendar event for a project.
     event_type must be one of: event, milestone.
     start_iso and end_iso must be ISO 8601 strings.
-    All events are created as all-day events by default.
-    Never ask the user for project_id — it is injected automatically.
     """
     return "intercepted"
 
@@ -192,28 +190,36 @@ def create_sprint(
     start_date: str,
     end_date: str,
 ) -> str:
-    """Create a new sprint for the project.
-    The user must provide sprint_name, sprint_goal, start_date and end_date (YYYY-MM-DD).
-    """
+    """Create a new sprint for the project."""
     return "intercepted"
 
 
 @tool
 def add_items_to_sprint(sprint_id: str) -> str:
-    """Trigger the item selection UI so the user can pick tasks for the sprint.
-    Call immediately after create_sprint succeeds.
-    """
+    """Trigger the item selection UI so the user can pick tasks for the sprint."""
     return "intercepted"
 
 
 @tool
 def setup_report_scheduler(project_id: str) -> str:
-    """Open or view the report scheduler form for a project.
+    """Open or view the report scheduler form for a project."""
+    return "intercepted"
 
-    Call this when the user wants to:
-    - View the current report scheduler configuration (if active)
-    - Set up or update automated reports for a project
-    - Enable or disable an existing scheduler or change report frequency/recipients
+
+@tool
+def bulk_create_tasks(project_id: str) -> str:
+    """Bulk create tasks extracted from uploaded PRDs / documents.
+    Agent specifies 4 key fields per task: title, description, priority, type.
+    Status defaults to 'not started' and estimation to today-tomorrow.
+    """
+    return "intercepted"
+
+
+@tool
+def bulk_create_issues(project_id: str) -> str:
+    """Bulk create issues extracted from uploaded documents or error logs.
+    Agent specifies 4 key fields per issue: title, description, environment, severity.
+    Status defaults to 'not opened' and due_date to day after tomorrow.
     """
     return "intercepted"
 
@@ -256,11 +262,28 @@ async def write_scheduler_to_convex(payload: dict) -> str:
             f"✅ Scheduler saved — "
             f"name='{payload.get('name')}' "
             f"frequency={payload.get('frequencyDays')} days "
-            f"recipientEmail='{payload.get('recipientEmail', 'owner email')}' "
             f"(id: {result.get('id', 'unknown')})"
         )
     except Exception as e:
         return f"❌ Failed to save scheduler: {e}"
+
+
+async def write_bulk_tasks_to_convex(payload: dict) -> str:
+    """Actual HTTP call to Convex for bulk task insertion after HITL approval."""
+    try:
+        result = await convex_post_async("bulkInsertTasks", payload)
+        return f"✅ Bulk created {result.get('count', 0)} task(s) in project."
+    except Exception as e:
+        return f"❌ Failed to bulk create tasks: {e}"
+
+
+async def write_bulk_issues_to_convex(payload: dict) -> str:
+    """Actual HTTP call to Convex for bulk issue insertion after HITL approval."""
+    try:
+        result = await convex_post_async("bulkInsertIssues", payload)
+        return f"✅ Bulk created {result.get('count', 0)} issue(s) in project."
+    except Exception as e:
+        return f"❌ Failed to bulk create issues: {e}"
 
 
 # Exported Agent Toolsets
@@ -276,6 +299,8 @@ ANALYST_TOOLS = [
     get_issues_summary,
     get_member_workload,
     get_project_insights,
+    bulk_create_tasks,
+    bulk_create_issues,
 ]
 
 SPRINT_TOOLS = [
