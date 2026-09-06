@@ -48,6 +48,7 @@ class SupervisorState(TypedDict):
     user_id: str
     user_name: Optional[str]
     project_id: Optional[str]
+    project_name: Optional[str]
     thread_id: Optional[str]
 
     # 3. Router Execution Control (Single or Parallel Multi-Agent Fan-Out)
@@ -80,7 +81,9 @@ class KayaState(MessagesState):
     user_name: Optional[str]
     thread_id: str
     project_id: Optional[str]
+    project_name: Optional[str]
     next: Union[str, List[str]]
+
     action_type: Optional[str]
     router_reasoning: Optional[str]
 

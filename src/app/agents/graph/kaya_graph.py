@@ -463,22 +463,11 @@ Your Persona & Standards:
 """
 
 
-def get_chat_llm(model_type: str = "fast") -> ChatOpenAI:
-    """Returns ChatOpenAI instance configured for OpenAI or Groq based on available keys with max_tokens set."""
-    openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+def get_direct_chat_llm() -> ChatOpenAI:
+    """Returns Groq 120b LLM for fast direct conversation/chit-chat when no sub-agents are invoked."""
     groq_key = os.getenv("GROQ_API_KEY", "").strip()
     max_tokens = int(os.getenv("KAYA_MAX_TOKENS", "700"))
-
-    if openai_key and model_type == "deep":
-        model_name = os.getenv("KAYA_DEEP_MODEL", "gpt-4.1-mini")
-        return ChatOpenAI(
-            model=model_name,
-            openai_api_key=openai_key,
-            temperature=0.2,
-            max_tokens=max_tokens,
-            streaming=True,
-        )
-    elif groq_key:
+    if groq_key:
         groq_model = os.getenv("GROQ_CHAT_MODEL", "openai/gpt-oss-120b")
         return ChatOpenAI(
             model=groq_model,
@@ -488,34 +477,62 @@ def get_chat_llm(model_type: str = "fast") -> ChatOpenAI:
             max_tokens=max_tokens,
             streaming=True,
         )
-    else:
-        model_name = os.getenv("KAYA_FAST_MODEL", "gpt-4.1-mini")
+    openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+    return ChatOpenAI(
+        model="gpt-4.1-mini",
+        openai_api_key=openai_key or "none",
+        temperature=0.2,
+        max_tokens=max_tokens,
+        streaming=True,
+    )
+
+
+def get_synthesizer_llm() -> ChatOpenAI:
+    """Returns gpt-4.1-mini LLM to synthesize sub-agent findings into high-impact PM responses."""
+    openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+    max_tokens = int(os.getenv("KAYA_MAX_TOKENS", "700"))
+    if openai_key:
         return ChatOpenAI(
-            model=model_name,
-            openai_api_key=openai_key or "none",
+            model="gpt-4.1-mini",
+            openai_api_key=openai_key,
             temperature=0.2,
             max_tokens=max_tokens,
             streaming=True,
         )
-
+    groq_key = os.getenv("GROQ_API_KEY", "").strip()
+    return ChatOpenAI(
+        model=os.getenv("GROQ_CHAT_MODEL", "openai/gpt-oss-120b"),
+        openai_api_key=groq_key or "none",
+        openai_api_base="https://api.groq.com/openai/v1",
+        temperature=0.2,
+        max_tokens=max_tokens,
+        streaming=True,
+    )
 
 
 async def kaya_direct_node(state: SupervisorState, config: RunnableConfig) -> Dict[str, Any]:
-    """Kaya Direct Response Node: Fast conversational greeting/chat with token streaming."""
+    """Kaya Direct Response Node: Fast conversational greeting/chit-chat using Groq 120b with token streaming."""
     _emit_stream_status("Kaya is typing...")
     user_name = state.get("user_name") or "there"
-    project_id = state.get("project_id")
-    current_date = datetime.now().strftime("%B %d, %Y")
+    project_name = state.get("project_name") or "your active project"
+    current_date = datetime.now().strftime("%A, %B %d, %Y")
 
-    system_prompt = (
-        f"{KAYA_SYSTEM_BASE}\n"
-        f"You are talking directly to {user_name}.\n"
-        f"Current Date: {current_date}\n"
-        f"Active Project ID: {project_id or 'None'}\n"
-        "Provide a warm, concise, and professional Product Manager greeting or answer."
-    )
+    system_prompt = f"""You are Kaya, an Executive Technical Project Manager on the WEKRAFT Platform.
+You are actively managing the project "{project_name}".
 
-    llm = get_chat_llm(model_type="fast")
+CONVERSATION CONTEXT:
+- Today's Real-World Date: {current_date}
+- Project Name: {project_name}
+- User Name: {user_name}
+
+YOUR OPERATING PRINCIPLES:
+1. Greet {user_name} professionally and warmly, acknowledging your role as the Technical PM for "{project_name}".
+2. Keep your direct response concise (2-3 sentences), executive, and focused on helping them drive the project forward today ({current_date}).
+3. ZERO Raw Database IDs: Under NO circumstances should you output, mention, or leak alphanumeric database IDs (such as 'kn71qtgem...' or 'nd7088...'). Always refer strictly to the project name and user name.
+4. If medical, legal, or non-project topics are asked, provide a polite, one-sentence deflection that you focus purely on technical project execution.
+"""
+
+    llm = get_direct_chat_llm()
 
     messages = [SystemMessage(content=system_prompt)] + list(state.get("messages", []))
     response = await llm.ainvoke(messages)
@@ -528,16 +545,22 @@ async def kaya_synthesizer_node(state: SupervisorState, config: RunnableConfig) 
     Kaya Synthesizer Node:
     - Ingests all sub-agent worker outputs (_analyst_messages, _db_write_messages, _sprint_messages).
     - Injects project details, deadline awareness, and current date.
-    - Synthesizes findings into a unified PM response, streaming tokens to user.
+    - Synthesizes findings using gpt-4.1-mini, streaming executive PM tokens to user.
     """
     _emit_stream_status("Kaya is synthesizing executive PM insights...")
     user_name = state.get("user_name") or "there"
-    project_id = state.get("project_id") or "Not set"
-    current_date = datetime.now().strftime("%B %d, %Y")
+    current_date = datetime.now().strftime("%A, %B %d, %Y")
 
-    # Project deadline awareness check
+    # Project deadline and name awareness check
     project_insights = state.get("project_insights") or {}
-    deadline_text = f"Project Deadline: {project_insights.get('deadline', 'N/A')} ({project_insights.get('daysRemaining', 'N/A')} days remaining)"
+    project_name = project_insights.get("projectName") or state.get("project_name") or "Active Project"
+    deadline_val = project_insights.get("deadline")
+    days_left = project_insights.get("daysRemaining")
+
+    if deadline_val:
+        deadline_text = f"{deadline_val} ({days_left} day(s) remaining from today)"
+    else:
+        deadline_text = "No deadline currently set"
 
     # Collect findings from sub-agents
     findings_blocks = []
@@ -554,33 +577,36 @@ async def kaya_synthesizer_node(state: SupervisorState, config: RunnableConfig) 
     findings_prompt = "\n\n".join(findings_blocks) if findings_blocks else "No worker findings generated."
 
     active_error = state.get("active_error")
-    error_instructions = f"\nNote: Active service error detected: {active_error}. Acknowledge this gracefully." if active_error else ""
+    error_instructions = f"\nNote: Active service error notice: {active_error}. Acknowledge this gracefully." if active_error else ""
 
-    system_prompt = f"""{KAYA_SYSTEM_BASE}
+    system_prompt = f"""You are Kaya, an Executive Technical Project Manager on the WEKRAFT Platform.
+You are actively managing the project "{project_name}".
 
-CONVERSATION CONTEXT:
-- Talking to: {user_name}
-- Active Project ID: {project_id}
-- Today's Date: {current_date}
-- {deadline_text}
+CONVERSATION & TEMPORAL CONTEXT:
+- Today's Real-World Date: {current_date}
+- Project Name: {project_name}
+- Project Target Deadline: {deadline_text}
+- User Name: {user_name}
 {error_instructions}
 
-SUB-AGENT WORKER DATA (DO NOT expose raw labels to user, synthesize seamlessly):
-{findings_prompt}
+YOUR PERSONA & STANDARDS:
+1. Executive PM Tone: Speak with crisp, authoritative, supportive professionalism. Avoid generic fluff, filler phrases, or introductory throat-clearing.
+2. Temporal Grounding & Proximity: Today is {current_date}. The target deadline is {deadline_text}. Use these real-world temporal anchors to evaluate timeline urgency, overdue risks, and sprint momentum without hallucinating dates.
+3. Strict Privacy & Zero Raw IDs: NEVER output, mention, or leak alphanumeric database IDs (such as 'kn71qtgem...' or 'nd7088...'). Use only the real project name ('{project_name}'), user name ('{user_name}'), and actual task/issue titles.
+4. Structured & Data-Driven: Ground your analysis strictly in the sub-agent findings below. Use clean Markdown bullet points, bold key terms, and mini tables where helpful.
+5. You can help Team manage Projects to avoid deadlines , tell about project progress , Team workloads , creation of Tasks and Issues , Sprints , Create calendar events and help prioritize work and create automated schedulers.
 
-INSTRUCTIONS:
-- Synthesize all findings into a crisp, PM-level answer for the user.
-- Emphasize key numbers, active blockers, sprint velocity, and upcoming deadlines.
-- Keep formatting clean with structured Markdown.
+SUB-AGENT WORKER DATA:
+{findings_prompt}
 """
 
-    model_type = config.get("configurable", {}).get("model", "fast") if config else "fast"
-    llm = get_chat_llm(model_type=model_type)
+    llm = get_synthesizer_llm()
 
     messages = [SystemMessage(content=system_prompt)] + list(state.get("messages", []))
     response = await llm.ainvoke(messages)
 
     return {"messages": [response]}
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────

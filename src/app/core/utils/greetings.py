@@ -22,14 +22,17 @@ GREETING_PATTERNS: List[re.Pattern] = [
 def is_greeting_query(text: str) -> bool:
     """
     Central helper to check if a user prompt is a greeting or casual opener.
-    Uses regex word boundaries and string inspection.
+    Only matches if the input is short (<= 4 words) and contains a greeting.
     """
     if not text or not text.strip():
         return False
 
     lowered = text.lower().strip()
+    words = lowered.split()
+    if len(words) > 4:
+        return False
 
-    # Exact match or starts with greeting
+    # Exact match
     if lowered in GREETINGS_LIST:
         return True
 

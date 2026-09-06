@@ -33,4 +33,4 @@ app = create_app()
 async def startup_event():
     print("[SERVER] FastAPI Agent App initialized")
     print("[SERVER] Active Route: /kaya")
-    print("[SERVER] Future Routes: /harry, /project-brain")
+
