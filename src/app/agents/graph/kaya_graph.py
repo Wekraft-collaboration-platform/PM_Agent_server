@@ -139,12 +139,15 @@ def _get_latest_user_text(messages: List[BaseMessage]) -> str:
     return ""
 
 
-def _emit_stream_status(status_text: str):
+def _emit_stream_status(status_text: str, reasoning: Optional[str] = None):
     """Emits custom SSE progress event for frontend status indicator."""
     try:
         from langgraph.config import get_stream_writer
         writer = get_stream_writer()
-        writer({"agent_status": status_text})
+        payload = {"agent_status": status_text}
+        if reasoning:
+            payload["reasoning"] = reasoning
+        writer(payload)
     except Exception:
         pass
 
@@ -159,8 +162,11 @@ async def supervisor_router_node(state: SupervisorState, config: RunnableConfig)
     user_query = _get_latest_user_text(messages)
     project_id = state.get("project_id")
 
-    _emit_stream_status("Kaya is understanding your request...")
+    _emit_stream_status("Kaya is thinking...")
     decision = await route_user_request(user_query, project_id)
+
+    # Immediately emit reasoning event so frontend displays it right after thinking
+    _emit_stream_status("Kaya is reasoning...", reasoning=decision.reasoning)
 
     return {
         "next": decision.actions,
