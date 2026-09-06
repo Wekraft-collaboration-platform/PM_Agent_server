@@ -22,20 +22,35 @@ def _get_convex_url() -> str:
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=5), reraise=True)
 async def convex_post_async(endpoint: str, payload: dict) -> dict:
     """Centralized async HTTP caller for Convex actions/queries with automatic retry logic."""
+    print(f"[CONVEX TOOL] Agent requested for tool '{endpoint}' with payload: {payload}")
     convex_url = _get_convex_url()
-    async with httpx.AsyncClient() as client:
-        r = await client.post(f"{convex_url}/{endpoint.lstrip('/')}", json=payload, timeout=12)
-        r.raise_for_status()
-        return r.json()
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.post(f"{convex_url}/{endpoint.lstrip('/')}", json=payload, timeout=12)
+            r.raise_for_status()
+            data = r.json()
+            print(f"[CONVEX TOOL] ✓ Completed '{endpoint}' successfully.")
+            return data
+    except Exception as e:
+        print(f"[CONVEX TOOL] ✗ Error requesting '{endpoint}': {e}")
+        raise
 
 
 def convex_post_sync(endpoint: str, payload: dict) -> dict:
     """Centralized sync HTTP caller for Convex actions/queries."""
+    print(f"[CONVEX TOOL] Agent requested for tool '{endpoint}' with payload: {payload}")
     convex_url = _get_convex_url()
-    with httpx.Client() as client:
-        r = client.post(f"{convex_url}/{endpoint.lstrip('/')}", json=payload, timeout=10)
-        r.raise_for_status()
-        return r.json()
+    try:
+        with httpx.Client() as client:
+            r = client.post(f"{convex_url}/{endpoint.lstrip('/')}", json=payload, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            print(f"[CONVEX TOOL] ✓ Completed '{endpoint}' successfully.")
+            return data
+    except Exception as e:
+        print(f"[CONVEX TOOL] ✗ Error requesting '{endpoint}': {e}")
+        raise
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -160,6 +175,80 @@ def get_project_insights(project_id: str) -> dict:
     except Exception as e:
         print(f"[get_project_insights] ✗ ERROR: {e}")
         return {"error": str(e)}
+
+
+@tool
+def get_scheduler(project_id: str) -> dict:
+    """Fetch the active automated report scheduler configuration for a project."""
+    print(f"[get_scheduler] querying — project={project_id}")
+    try:
+        data = convex_post_sync("getScheduler", {"projectId": project_id})
+        scheduler = data.get("scheduler")
+        return {"exists": False} if not scheduler else {"exists": True, **scheduler}
+    except Exception as e:
+        print(f"[get_scheduler] ✗ ERROR: {e}")
+        return {"error": str(e)}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ASYNC PARALLEL FETCHERS (Used by Sub-Agents for concurrent execution)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def fetch_user_standup_async(project_id: str, user_id: str) -> dict:
+    try:
+        data = await convex_post_async("getUserStandup", {"projectId": project_id, "userId": user_id})
+        return data.get("standup", {}) or {"status": "empty", "message": "No active tasks or standup items found."}
+    except Exception as e:
+        return {"error": f"Standup fetch error: {e}"}
+
+
+async def fetch_tasks_summary_async(project_id: str) -> dict:
+    try:
+        data = await convex_post_async("getTasksSummary", {"projectId": project_id})
+        return data.get("tasksSummary", {}) or {"status": "empty", "message": "No tasks found."}
+    except Exception as e:
+        return {"error": f"Tasks summary fetch error: {e}"}
+
+
+async def fetch_issues_summary_async(project_id: str) -> dict:
+    try:
+        data = await convex_post_async("getIssuesSummary", {"projectId": project_id})
+        return data.get("issuesSummary", {}) or {"status": "empty", "message": "No active issues found."}
+    except Exception as e:
+        return {"error": f"Issues summary fetch error: {e}"}
+
+
+async def fetch_member_workload_async(project_id: str) -> dict:
+    try:
+        data = await convex_post_async("getMemberWorkloadPYAgent", {"projectId": project_id})
+        return {"members": data.get("members", [])}
+    except Exception as e:
+        return {"error": f"Member workload fetch error: {e}"}
+
+
+async def fetch_sprint_insights_async(project_id: str) -> dict:
+    try:
+        data = await convex_post_async("getSprintInsights", {"projectId": project_id})
+        return {"sprints": data.get("sprints", [])}
+    except Exception as e:
+        return {"error": f"Sprint insights fetch error: {e}"}
+
+
+async def fetch_project_insights_async(project_id: str) -> dict:
+    try:
+        data = await convex_post_async("getProjectInsights", {"projectId": project_id})
+        return data.get("projectInsights", {}) or {"status": "empty", "message": "No project insights available."}
+    except Exception as e:
+        return {"error": f"Project insights fetch error: {e}"}
+
+
+async def fetch_scheduler_async(project_id: str) -> dict:
+    try:
+        data = await convex_post_async("getScheduler", {"projectId": project_id})
+        scheduler = data.get("scheduler")
+        return {"exists": False} if not scheduler else {"exists": True, **scheduler}
+    except Exception as e:
+        return {"error": f"Scheduler fetch error: {e}"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────

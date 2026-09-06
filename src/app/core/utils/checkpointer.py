@@ -30,7 +30,7 @@ def get_memory_checkpointer() -> MemorySaver:
 def get_checkpointer() -> Any:
     """
     Returns the global configured checkpointer instance.
-    Primary: Upstash Redis (UPSTASH_REDIS_URL / REDIS_URL) via langgraph.checkpoint.redis
+    Primary: Upstash Redis (UPSTASH_REDIS_URL / REDIS_URL) via langgraph.checkpoint.redis.aio.AsyncRedisSaver
     Fallback: MemorySaver
     """
     global _checkpointer_instance
@@ -40,19 +40,15 @@ def get_checkpointer() -> Any:
     redis_url = os.getenv("UPSTASH_REDIS_URL") or os.getenv("REDIS_URL")
     if redis_url:
         try:
-            from langgraph.checkpoint.redis import RedisSaver
-            from redis import Redis
+            from langgraph.checkpoint.redis.aio import AsyncRedisSaver
 
-            conn = Redis.from_url(redis_url)
-            _checkpointer_instance = RedisSaver(conn)
-            logger.info("Initialized RedisSaver checkpointer with Upstash Redis successfully.")
+            _checkpointer_instance = AsyncRedisSaver(redis_url=redis_url)
+            print("[CHECKPOINTER] AsyncRedisSaver connected to Redis/Upstash successfully.")
             return _checkpointer_instance
         except Exception as e:
-            logger.warning(
-                f"Failed to initialize RedisSaver ({e}). Falling back to MemorySaver."
-            )
+            print(f"[CHECKPOINTER WARNING] Failed to initialize AsyncRedisSaver ({e}). Falling back to MemorySaver.")
 
-    logger.info("Using MemorySaver checkpointer.")
+    print("[CHECKPOINTER] Using MemorySaver checkpointer.")
     _checkpointer_instance = MemorySaver()
     return _checkpointer_instance
 
@@ -66,16 +62,13 @@ async def get_async_checkpointer() -> Any:
     if redis_url:
         try:
             from langgraph.checkpoint.redis.aio import AsyncRedisSaver
-            from redis.asyncio import Redis as AsyncRedis
 
-            conn = AsyncRedis.from_url(redis_url)
-            checkpointer = AsyncRedisSaver(conn)
-            logger.info("Initialized AsyncRedisSaver checkpointer with Upstash Redis successfully.")
+            checkpointer = AsyncRedisSaver(redis_url=redis_url)
             return checkpointer
         except Exception as e:
             logger.warning(
                 f"Failed to initialize AsyncRedisSaver ({e}). Falling back to MemorySaver."
             )
 
-    logger.info("Using MemorySaver checkpointer.")
     return MemorySaver()
+

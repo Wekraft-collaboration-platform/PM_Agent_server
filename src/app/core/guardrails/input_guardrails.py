@@ -32,8 +32,7 @@ PROMPT_INJECTION_AND_OFFTOPIC_PATTERNS = [
     r"\b(rust|python|c\+\+|java|javascript|typescript|golang|html|css) (code|script|program)\b",
     
     # Medical / Health Advice
-    r"\b(medical|doctor|medicine|diagnosis|clinical health|treatment|prescription|cure|symptom)\b",
-
+    r"\b(medical|doctor|medicine|medicines|headache|pain|illness|disease|treatment|prescription|cure|symptom|symptoms|drug|drugs|pill|pills|clinical health)\b",
     
     # Harming / Violence / Illegal
     r"\b(bomb|hack|exploit|malware|weapon|kill|harm|suicide)\b",
@@ -116,6 +115,7 @@ class InputGuardrails:
         If risk score > 0.8, returns False immediately.
         """
         groq_key = os.getenv("GROQ_API_KEY", self.groq_api_key)
+        safeguard_model = os.getenv("GROQ_SAFEGUARD_MODEL", self.groq_model)
         if not groq_key:
             return True, 0.0, "Groq API key not set; skipping LLM guardrail check."
 
@@ -125,7 +125,7 @@ class InputGuardrails:
             "Content-Type": "application/json",
         }
         payload = {
-            "model": self.groq_model,
+            "model": safeguard_model,
             "messages": [
                 {"role": "system", "content": GUARDRAIL_SYSTEM_PROMPT},
                 {"role": "user", "content": text},

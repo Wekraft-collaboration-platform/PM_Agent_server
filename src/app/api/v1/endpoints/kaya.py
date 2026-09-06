@@ -6,6 +6,7 @@ from langchain_core.messages import HumanMessage
 from langgraph.types import Command
 from sse_starlette.sse import EventSourceResponse
 
+from app.agents.graph.kaya_graph import kaya_graph
 from app.core.utils import (
     message_chunk_event,
     checkpoint_event,
@@ -13,6 +14,7 @@ from app.core.utils import (
     custom_event,
     error_event,
 )
+from langchain_core.messages import AIMessageChunk
 
 router = APIRouter(prefix="/kaya", tags=["Kaya AI Agent"])
 
@@ -41,18 +43,86 @@ async def kaya_agent_endpoint(request: Request):
 
     config = {"configurable": {"thread_id": thread_id, "model": model}}
 
+    if request_type == "run":
+        graph_input = body.get("state") or {}
+        graph_input["user_id"] = user_id
+        graph_input["user_name"] = user_name
+        graph_input["project_id"] = project_id
+
+    elif request_type == "resume":
+        resume_value = body.get("resume", "cancel")
+        graph_input = Command(resume=resume_value)
+
+    elif request_type == "fork":
+        cfg = body.get("config")
+        if not cfg:
+            raise HTTPException(status_code=400, detail="config is required for fork")
+        fork_state = body.get("state", None)
+        config = await kaya_graph.aupdate_state(cfg, fork_state)
+        graph_input = None
+
+    elif request_type == "replay":
+        cfg = body.get("config")
+        if not cfg:
+            raise HTTPException(status_code=400, detail="config is required for replay")
+        graph_input = None
+
+    else:
+        user_message = body.get("message")
+        if user_message:
+            graph_input = {
+                "messages": [HumanMessage(content=user_message)],
+                "user_id": user_id,
+                "user_name": user_name,
+                "project_id": project_id,
+                "thread_id": thread_id,
+            }
+        else:
+            graph_input = body.get("state", None)
+
     stop_event = asyncio.Event()
     active_connections[thread_id] = stop_event
 
     async def generate_events() -> AsyncGenerator[dict, None]:
         try:
-            # Yield initial connection confirmation
             yield custom_event({"status": "connected", "thread_id": thread_id, "agent": "kaya"})
 
-            # Note: graph.astream will stream when graph module is attached
-            yield custom_event({"status": "ready", "agent": "kaya"})
+            async for chunk in kaya_graph.astream(
+                graph_input,
+                config,
+                stream_mode=["debug", "messages", "updates", "custom"],
+            ):
+                if stop_event.is_set():
+                    break
+
+                chunk_type, chunk_data = chunk
+
+                if chunk_type == "custom":
+                    yield custom_event(chunk_data)
+
+                elif chunk_type == "debug":
+                    debug_type = chunk_data.get("type")
+                    if debug_type == "checkpoint":
+                        yield checkpoint_event(chunk_data["payload"])
+                    elif debug_type == "task_result":
+                        interrupts = chunk_data["payload"].get("interrupts", [])
+                        if interrupts:
+                            yield interrupt_event(interrupts)
+
+                elif chunk_type == "messages":
+                    msg, metadata = chunk_data
+                    node_name = metadata.get("langgraph_node", "unknown")
+
+                    if isinstance(msg, AIMessageChunk):
+                        has_content = bool(msg.content or msg.tool_call_chunks)
+                        if has_content:
+                            yield message_chunk_event(node_name, msg)
+
+            # Mark completion
+            yield custom_event({"status": "completed", "thread_id": thread_id, "agent": "kaya"})
 
         except Exception as e:
+            print(f"[/kaya STREAM ERROR] {e}")
             yield error_event(str(e))
         finally:
             active_connections.pop(thread_id, None)
