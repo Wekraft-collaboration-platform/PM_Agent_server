@@ -139,15 +139,30 @@ def _get_latest_user_text(messages: List[BaseMessage]) -> str:
     return ""
 
 
-def _emit_stream_status(status_text: str, reasoning: Optional[str] = None):
+def _emit_stream_status(
+    status_text: Optional[str] = None,
+    reasoning: Optional[str] = None,
+    subagent_called: Optional[str] = None,
+    tool_called: Optional[str] = None,
+    caller: Optional[str] = None,
+):
     """Emits custom SSE progress event for frontend status indicator."""
     try:
         from langgraph.config import get_stream_writer
         writer = get_stream_writer()
-        payload = {"agent_status": status_text}
+        payload = {}
+        if status_text:
+            payload["agent_status"] = status_text
         if reasoning:
             payload["reasoning"] = reasoning
-        writer(payload)
+        if subagent_called:
+            payload["subagent_called"] = subagent_called
+        if tool_called:
+            payload["tool_called"] = tool_called
+            if caller:
+                payload["caller"] = caller
+        if payload:
+            writer(payload)
     except Exception:
         pass
 
@@ -162,11 +177,20 @@ async def supervisor_router_node(state: SupervisorState, config: RunnableConfig)
     user_query = _get_latest_user_text(messages)
     project_id = state.get("project_id")
 
-    _emit_stream_status("Kaya is thinking...")
+    _emit_stream_status(status_text="Kaya is thinking...")
     decision = await route_user_request(user_query, project_id)
 
     # Immediately emit reasoning event so frontend displays it right after thinking
-    _emit_stream_status("Kaya is reasoning...", reasoning=decision.reasoning)
+    _emit_stream_status(status_text="Kaya is reasoning...", reasoning=decision.reasoning)
+
+    # Emit subagent delegation events for actions selected
+    for action in decision.actions:
+        if action == "analyst":
+            _emit_stream_status(subagent_called="analyst_agent")
+        elif action == "sprint":
+            _emit_stream_status(subagent_called="sprint_agent")
+        elif action == "db_write":
+            _emit_stream_status(subagent_called="db_write_agent")
 
     return {
         "next": decision.actions,
@@ -206,7 +230,7 @@ async def analyst_worker_node(state: SupervisorState, config: RunnableConfig) ->
     - Normalizes results into non-empty structured Markdown findings.
     - Wrapped in try/except for graceful error reporting.
     """
-    _emit_stream_status("Analyst worker analyzing project health & tasks in parallel...")
+    _emit_stream_status(status_text="Analyst worker analyzing project health & tasks in parallel...")
     project_id = state.get("project_id") or ""
     user_id = state.get("user_id") or ""
     messages = state.get("messages", [])
@@ -224,6 +248,15 @@ async def analyst_worker_node(state: SupervisorState, config: RunnableConfig) ->
         # Determine parallel tool fetch requirements based on user query
         need_standup = any(k in user_query for k in ["standup", "my task", "assigned", "my issue", "today", "to do"])
         need_workload = any(k in user_query for k in ["workload", "team", "members", "who is working", "capacity"])
+
+        # Emit live tool call events
+        _emit_stream_status(tool_called="get_tasks_summary", caller="Project analyst")
+        _emit_stream_status(tool_called="get_issues_summary", caller="Project analyst")
+        _emit_stream_status(tool_called="get_project_insights", caller="Project analyst")
+        if need_standup:
+            _emit_stream_status(tool_called="get_user_standup", caller="Project analyst")
+        if need_workload:
+            _emit_stream_status(tool_called="get_member_workload", caller="Project analyst")
 
         # Execute read tools in parallel concurrently
         tasks_future = fetch_tasks_summary_async(project_id)
@@ -339,7 +372,7 @@ async def db_write_worker_node(state: SupervisorState, config: RunnableConfig) -
     - Handles state mutations and HITL write flows (calendar events, report schedulers, bulk PRD items).
     - Wrapped in try/except for graceful error reporting.
     """
-    _emit_stream_status("DB Write worker searching memory & preparing actions...")
+    _emit_stream_status(status_text="DB Write worker searching memory & preparing actions...")
     project_id = state.get("project_id") or ""
     user_id = state.get("user_id") or ""
     messages = state.get("messages", [])
@@ -349,12 +382,14 @@ async def db_write_worker_node(state: SupervisorState, config: RunnableConfig) -
         memories = []
         # Search Mem0 for user memory/preferences
         if any(k in user_query.lower() for k in ["remember", "preference", "last time", "memory", "favorite", "my info"]):
+            _emit_stream_status(tool_called="search_user_memory", caller="DB Write agent")
             mem_result = search_user_memory.invoke({"user_id": user_id, "query": user_query})
             memories = mem_result.get("memories", [])
 
         # Check for report scheduler queries
         scheduler_info = None
         if "scheduler" in user_query.lower() or "report" in user_query.lower():
+            _emit_stream_status(tool_called="get_scheduler", caller="DB Write agent")
             scheduler_info = await fetch_scheduler_async(project_id)
 
         lines = ["### DB Write / Memory Sub-Agent Findings:"]
@@ -396,7 +431,7 @@ async def sprint_worker_node(state: SupervisorState, config: RunnableConfig) -> 
     - Handles sprint creation / task assignment workflows.
     - Wrapped in try/except for graceful error reporting.
     """
-    _emit_stream_status("Sprint worker inspecting sprint velocity & backlog...")
+    _emit_stream_status(status_text="Sprint worker inspecting sprint velocity & backlog...")
     project_id = state.get("project_id") or ""
 
     if not project_id:
@@ -408,6 +443,9 @@ async def sprint_worker_node(state: SupervisorState, config: RunnableConfig) -> 
         }
 
     try:
+        _emit_stream_status(tool_called="get_sprint_insights", caller="Sprint manager")
+        _emit_stream_status(tool_called="get_project_insights", caller="Sprint manager")
+
         # Fetch sprint insights and project insights in parallel
         sprints_res, project_res = await asyncio.gather(
             fetch_sprint_insights_async(project_id),
@@ -518,7 +556,7 @@ def get_synthesizer_llm() -> ChatOpenAI:
 
 async def kaya_direct_node(state: SupervisorState, config: RunnableConfig) -> Dict[str, Any]:
     """Kaya Direct Response Node: Fast conversational greeting/chit-chat using Groq 120b with token streaming."""
-    _emit_stream_status("Kaya is typing...")
+    _emit_stream_status(status_text="Kaya is typing...")
     user_name = state.get("user_name") or "there"
     project_name = state.get("project_name") or "your active project"
     current_date = datetime.now().strftime("%A, %B %d, %Y")
@@ -553,7 +591,7 @@ async def kaya_synthesizer_node(state: SupervisorState, config: RunnableConfig) 
     - Injects project details, deadline awareness, and current date.
     - Synthesizes findings using gpt-4.1-mini, streaming executive PM tokens to user.
     """
-    _emit_stream_status("Kaya is synthesizing executive PM insights...")
+    _emit_stream_status(status_text="Kaya is synthesizing executive PM insights...")
     user_name = state.get("user_name") or "there"
     current_date = datetime.now().strftime("%A, %B %d, %Y")
 
