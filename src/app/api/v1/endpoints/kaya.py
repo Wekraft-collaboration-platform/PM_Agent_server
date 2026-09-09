@@ -116,6 +116,21 @@ async def kaya_agent_endpoint(request: Request):
             if graph_input and "messages" in graph_input:
                 graph_input["messages"] = _normalize_messages(graph_input["messages"])
 
+    # ── User-Scoped Document Attachment Resolution ──
+    file_id: Optional[str] = body.get("file_id") or (body.get("state", {}).get("file_id") if isinstance(body.get("state"), dict) else None)
+    if file_id and isinstance(graph_input, dict):
+        graph_input["file_id"] = file_id
+        try:
+            from app.core.utils.document_parser import get_parsed_document_from_cache
+            cached_doc = await get_parsed_document_from_cache(user_id=user_id, file_id=file_id)
+            if cached_doc:
+                graph_input["attached_document"] = cached_doc
+                print(f"[/kaya] Successfully resolved scoped document {file_id} for user {user_id}")
+            else:
+                print(f"[/kaya] Warning: file_id {file_id} not found or unauthorized for user {user_id}")
+        except Exception as doc_err:
+            print(f"[/kaya] Error resolving document {file_id}: {doc_err}")
+
     # ── Run Input Guardrails on Latest User Message ──
     if isinstance(graph_input, dict) and "messages" in graph_input and graph_input["messages"]:
         latest_user_text = ""
