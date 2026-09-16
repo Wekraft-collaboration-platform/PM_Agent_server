@@ -18,6 +18,7 @@ Architecture:
 """
 
 import os
+import json
 import asyncio
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Union
@@ -34,6 +35,7 @@ from langchain_core.messages import (
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import interrupt
+from langgraph.errors import GraphInterrupt
 from langchain_core.runnables import RunnableConfig
 
 from app.state.state import SupervisorState, RESET_SENTINEL
@@ -67,11 +69,11 @@ load_dotenv(override=True)
 class SupervisorDecision(BaseModel):
     actions: List[str] = Field(
         description=(
-            "List of sub-agent actions to trigger in parallel (can select 1 or multiple):\n"
-            "- 'mcp': third-party SaaS tool integrations (Jira tickets/issues/sprints, Linear issues/cycles, Slack messages/channels, Calendly scheduling/availability, Notion docs/PRDs)\n"
+            "List of sub-agent actions to trigger in parallel (select ONLY the sub-agents explicitly required):\n"
+            "- 'mcp': ONLY for third-party external integrations (explicitly requested Jira, Linear, Slack, Calendly, Notion, MCP). NEVER call for internal project tasks/issues/sprints or If user dosent asked for third party.\n"
             "- 'db_write': user memory search (Mem0), calendar events, report scheduler setup, or bulk task creation\n"
             "- 'analyst': internal project database analytics: user daily standup, task summaries, issue tracking, member workloads, project health, deadlines\n"
-            "- 'sprint': sprint insights/velocity, sprint creation, or backlog item assignments\n"
+            "- 'sprint': sprint insights/velocity, active sprint status, sprint creation, or backlog item assignments\n"
             "- 'direct_response': simple greeting, casual conversation, or general product manager chat"
         )
     )
@@ -79,26 +81,37 @@ class SupervisorDecision(BaseModel):
 
 
 ROUTER_SYSTEM_PROMPT = """You are the primary Supervisor Router for the WEKRAFT AI Platform.
-Analyze the user's incoming query and decide which specialized sub-agent workers to trigger:
+Analyze the user's incoming query and decide strictly which specialized sub-agent workers to trigger.
+
+CRITICAL RULES:
+1. THIRD-PARTY / MCP AGENT ('mcp'):
+   - ONLY call 'mcp' if the user EXPLICITLY asks for a third-party app or external tool (Jira, Linear, Slack, Calendly, Notion, external service, MCP).
+   - NEVER call 'mcp' for general project tasks, issues, sprints, or standups if no third-party integration was explicitly mentioned.
+
+2. SPRINT AGENT ('sprint'):
+   - ALWAYS call 'sprint' whenever the user asks about sprints (sprint progress, active sprint, sprint velocity, sprint tasks, sprint items, sprint creation, sprint planning).
+
+3. MINIMAL SUB-AGENT CALLS:
+   - NEVER call extra sub-agents if not asked by the user. Route ONLY to the exact sub-agents necessary to fulfill the user's request.
+   - Example 1: 'what are my tasks/issues and sprints' -> ['analyst', 'sprint'] (NO 'mcp').
+   - Example 2: 'show my tasks and standup' -> ['analyst'] (NO 'sprint', NO 'mcp').
+   - Example 3: 'how is the current sprint doing' -> ['sprint'] (NO 'analyst', NO 'mcp').
+   - Example 4: 'check jira tickets and slack' -> ['mcp'].
+   - Example 5: 'hi how are you' -> ['direct_response'].
 
 Available Actions:
-1. 'mcp': Third-party SaaS integrations: Jira issues/tickets/epics/sprints, Linear issue tracking/cycles, Slack channels/messages/posts, Calendly meeting schedules/availability, or Notion PRD/wiki docs.
+1. 'mcp': Third-party SaaS integrations ONLY (Jira, Linear, Slack, Calendly, Notion).
 2. 'db_write': State mutations or personal memory: Long-term memory search (Mem0), calendar event scheduling, report scheduler setup, or bulk PRD task/issue generation.
 3. 'analyst': Internal read-only analytics: User daily standup, task summaries, issue tracking, member workloads, project health, or project deadlines/timelines.
 4. 'sprint': Sprint velocity, active sprint progress, sprint creation, or backlog item allocation.
 5. 'direct_response': Greetings (hi, hello), casual conversation, or general questions requiring no live database queries.
-
-Rules:
-- If the user query mentions or asks about Jira, Linear, Slack, Calendly, Notion, external tickets, integrations, or MCP tools, you MUST include 'mcp' in actions.
-- If the user asks for project tasks, issues, tracking, or sprint status, and mentions or implies connected tools (e.g. Jira, Linear), select BOTH ['analyst', 'mcp'].
-- Select MULTIPLE sub-agents if the user query asks for multiple aspects (e.g. 'Show my standup and Jira issues' -> ['analyst', 'mcp'], 'Check Linear issues and send a Slack update' -> ['mcp']).
-- If the query is just a greeting or general dialogue, choose ONLY ['direct_response'].
 """
 
 
 async def route_user_request(user_input: str, project_id: Optional[str] = None) -> SupervisorDecision:
-    """Evaluates user input using Groq LLM router and outputs structured SupervisorDecision with deterministic safeguards."""
+    """Evaluates user input using Groq 120b LLM router and outputs structured SupervisorDecision with deterministic safeguards."""
     groq_api_key = os.getenv("GROQ_API_KEY", "")
+    # Ensure 120b model is used for the router (openai/gpt-oss-120b)
     router_model = os.getenv("GROQ_ROUTER_MODEL", "openai/gpt-oss-120b")
 
     messages = [
@@ -120,15 +133,33 @@ async def route_user_request(user_input: str, project_id: Optional[str] = None) 
         if not decision.actions:
             decision.actions = ["direct_response"]
 
-        # Deterministic safeguard: if user explicitly mentions any MCP tool/integration keyword, guarantee 'mcp' is included
-        mcp_keywords = ["jira", "linear", "slack", "calendly", "notion", "mcp", "integration", "ticket", "external", "atlassian"]
         lower_query = user_input.lower()
-        if any(k in lower_query for k in mcp_keywords):
-            if "mcp" not in decision.actions:
+
+        # Rule 1 Deterministic Safeguard: Never call MCP unless explicitly requested
+        mcp_explicit_keywords = ["jira", "linear", "slack", "calendly", "notion", "mcp", "atlassian"]
+        has_explicit_mcp = any(k in lower_query for k in mcp_explicit_keywords)
+        if not has_explicit_mcp and "mcp" in decision.actions:
+            decision.actions.remove("mcp")
+            if not decision.actions:
+                decision.actions = ["analyst"]
+        elif has_explicit_mcp and "mcp" not in decision.actions:
+            if "direct_response" in decision.actions:
+                decision.actions.remove("direct_response")
+            decision.actions.append("mcp")
+            decision.reasoning += " (MCP auto-included due to explicit keyword match)"
+
+        # Rule 2 Deterministic Safeguard: Always call sprint agent for sprint queries
+        sprint_keywords = ["sprint", "sprints", "velocity", "backlog", "burndown"]
+        if any(k in lower_query for k in sprint_keywords):
+            if "sprint" not in decision.actions:
                 if "direct_response" in decision.actions:
                     decision.actions.remove("direct_response")
-                decision.actions.append("mcp")
-                decision.reasoning += " (MCP auto-included due to keyword match)"
+                decision.actions.append("sprint")
+                decision.reasoning += " (Sprint agent auto-included due to sprint keyword match)"
+
+        # Rule 3: Clean up direct_response if actionable subagents exist
+        if len(decision.actions) > 1 and "direct_response" in decision.actions:
+            decision.actions.remove("direct_response")
 
         safe_reasoning = decision.reasoning.encode("ascii", "replace").decode("ascii")
         print(f"[ROUTER DECISION] Actions: {decision.actions} | Reasoning: {safe_reasoning}")
@@ -137,10 +168,17 @@ async def route_user_request(user_input: str, project_id: Optional[str] = None) 
     except Exception as e:
         safe_err = str(e).encode("ascii", "replace").decode("ascii")
         print(f"[ROUTER WARNING] Fallback routing due to: {safe_err}")
-        actions = ["direct_response"]
-        mcp_keywords = ["jira", "linear", "slack", "calendly", "notion", "mcp", "integration", "ticket", "external", "atlassian"]
-        if any(k in user_input.lower() for k in mcp_keywords):
-            actions = ["mcp"]
+        actions = []
+        lower_query = user_input.lower()
+        if any(k in lower_query for k in ["sprint", "sprints", "velocity"]):
+            actions.append("sprint")
+        if any(k in lower_query for k in ["task", "tasks", "issue", "issues", "standup", "workload", "health", "project"]):
+            actions.append("analyst")
+        if any(k in lower_query for k in ["jira", "linear", "slack", "calendly", "notion", "mcp"]):
+            actions.append("mcp")
+        if not actions:
+            actions = ["direct_response"]
+
         return SupervisorDecision(
             actions=actions,
             reasoning=f"Fallback routing: {safe_err}",
@@ -373,6 +411,8 @@ async def analyst_worker_node(state: SupervisorState, config: RunnableConfig) ->
             "project_insights": project_data,
         }
 
+    except GraphInterrupt:
+        raise
     except Exception as e:
         error_msg = f"Analyst Sub-Agent encountered an error: {e}"
         print(f"[ANALYST WORKER ERROR] {error_msg}")
@@ -389,11 +429,43 @@ async def analyst_worker_node(state: SupervisorState, config: RunnableConfig) ->
 # SUB-AGENT 2: DB WRITE WORKER (Mem0 & HITL Write Schema Tools)
 # ─────────────────────────────────────────────────────────────────────────────
 
+class TaskDraftItem(BaseModel):
+    title: str = Field(description="Clean, concise title of the task")
+    description: Optional[str] = Field(default="", description="Detailed description or context")
+    priority: Optional[str] = Field(default="medium", description="Priority level: 'high', 'medium', or 'low'")
+
+
+class IssueDraftItem(BaseModel):
+    title: str = Field(description="Clean, concise title of the issue or bug")
+    description: Optional[str] = Field(default="", description="Detailed description of bug or issue")
+    severity: Optional[str] = Field(default="medium", description="Severity level: 'critical', 'high', 'medium', or 'low'")
+    priority: Optional[str] = Field(default="medium", description="Priority: 'high', 'medium', 'low'")
+
+
+class CalendarDraftEvent(BaseModel):
+    title: str = Field(description="Title of meeting or event")
+    description: Optional[str] = Field(default="", description="Event description or agenda")
+    event_type: Optional[str] = Field(default="event", description="'event' or 'milestone'")
+    start_iso: Optional[str] = Field(default="", description="Start time in ISO 8601 format (YYYY-MM-DDTHH:MM:SS)")
+    end_iso: Optional[str] = Field(default="", description="End time in ISO 8601 format (YYYY-MM-DDTHH:MM:SS)")
+    all_day: Optional[bool] = Field(default=False, description="Whether event is all day")
+
+
+class DBWriteIntentExtraction(BaseModel):
+    is_task_creation: bool = Field(default=False, description="True if user wants to create one or more tasks")
+    tasks: List[TaskDraftItem] = Field(default_factory=list, description="List of tasks to create")
+    is_issue_creation: bool = Field(default=False, description="True if user wants to create one or more issues")
+    issues: List[IssueDraftItem] = Field(default_factory=list, description="List of issues to create")
+    is_calendar_event: bool = Field(default=False, description="True if user wants to schedule a calendar event or meeting")
+    calendar_event: Optional[CalendarDraftEvent] = Field(default=None, description="Calendar event details if requested")
+
+
 async def db_write_worker_node(state: SupervisorState, config: RunnableConfig) -> Dict[str, Any]:
     """
     DB Write Sub-Agent:
     - Handles Mem0 long-term memory searches.
-    - Handles state mutations and HITL write flows (calendar events, report schedulers, bulk PRD items).
+    - Handles state mutations and HITL write flows (task creation, issue creation, calendar events, report schedulers).
+    - Triggers langgraph.types.interrupt(...) for user confirmation before executing state writes.
     - Wrapped in try/except for graceful error reporting.
     """
     _emit_stream_status(status_text="DB Write worker searching memory & preparing actions...")
@@ -401,6 +473,7 @@ async def db_write_worker_node(state: SupervisorState, config: RunnableConfig) -
     user_id = state.get("user_id") or ""
     messages = state.get("messages", [])
     user_query = _get_latest_user_text(messages)
+    lines = ["### DB Write / Mutation Sub-Agent Findings:"]
 
     try:
         memories = []
@@ -409,20 +482,207 @@ async def db_write_worker_node(state: SupervisorState, config: RunnableConfig) -
             _emit_stream_status(tool_called="search_user_memory", caller="DB Write agent")
             mem_result = search_user_memory.invoke({"user_id": user_id, "query": user_query})
             memories = mem_result.get("memories", [])
+            if memories:
+                lines.append(f"- **Retrieved Memory**: Found {len(memories)} relevant past user context entries.")
 
         # Check for report scheduler queries
-        scheduler_info = None
         if "scheduler" in user_query.lower() or "report" in user_query.lower():
             _emit_stream_status(tool_called="get_scheduler", caller="DB Write agent")
             scheduler_info = await fetch_scheduler_async(project_id)
+            if scheduler_info:
+                exists = scheduler_info.get("exists", False)
+                lines.append(f"- **Scheduler Status**: {'Active scheduler configured' if exists else 'No active report scheduler configured'}")
 
-        lines = ["### DB Write / Memory Sub-Agent Findings:"]
-        if memories:
-            lines.append(f"- **Retrieved Memory**: Found {len(memories)} relevant past user context entries.")
-        if scheduler_info:
-            exists = scheduler_info.get("exists", False)
-            lines.append(f"- **Scheduler Status**: {'Active scheduler configured' if exists else 'No active report scheduler configured'}")
-        if not memories and not scheduler_info:
+        # Check if user query involves task creation, issue creation, or calendar event scheduling
+        write_keywords = ["create", "add", "new task", "new issue", "schedule", "meeting", "calendar", "event", "make task", "generate task", "task-", "bulk", "issue-"]
+        lower_query = user_query.lower()
+
+        if any(k in lower_query for k in write_keywords):
+            try:
+                groq_api_key = os.getenv("GROQ_API_KEY", "")
+                extractor_model = os.getenv("GROQ_ROUTER_MODEL", "openai/gpt-oss-120b")
+                extractor_llm = ChatOpenAI(
+                    model=extractor_model,
+                    openai_api_key=groq_api_key,
+                    openai_api_base="https://api.groq.com/openai/v1",
+                    temperature=0.0,
+                ).with_structured_output(DBWriteIntentExtraction)
+
+                extraction_prompt = [
+                    SystemMessage(content=(
+                        f"Today's Date: {datetime.now().strftime('%Y-%m-%d')}.\n"
+                        "Extract structured write intentions (task creation, issue creation, calendar events) from the user query.\n"
+                        "Clean up task/issue names (e.g. 'task named-task-101' -> title: 'task-101', 'task-102' -> title: 'task-102'). Do not add placeholder description text."
+                    )),
+                    HumanMessage(content=f"User Query: '{user_query}'"),
+                ]
+                extracted: DBWriteIntentExtraction = await extractor_llm.ainvoke(extraction_prompt)
+
+                # ── 1. Handle Task Creation HITL Interrupt ──────────────────
+                if extracted.is_task_creation and extracted.tasks:
+                    task_items_preview = [
+                        {
+                            "title": t.title.replace("named-", "").strip(),
+                            "description": t.description if (t.description and not t.description.startswith("Task requested")) else "",
+                            "priority": t.priority if t.priority in ["high", "medium", "low"] else "medium",
+                        }
+                        for t in extracted.tasks
+                    ]
+                    tool_name = "bulk_create_tasks" if len(task_items_preview) > 1 else "create_task"
+                    interrupt_payload = {
+                        "tool": tool_name,
+                        "message": f"Review and approve {len(task_items_preview)} task(s) to create:",
+                        "preview": {
+                            "type": "task",
+                            "tasks": task_items_preview,
+                        },
+                    }
+
+                    print("\n" + "=" * 70)
+                    print(f"[HITL GRAPH_INTERRUPT] 🛑 PAUSING GRAPH FOR TASK CREATION APPROVAL")
+                    print(f"[HITL TOOL NAME] {tool_name}")
+                    print(f"[HITL PREVIEW CONTENT] Payload:\n{json.dumps(interrupt_payload, indent=2)}")
+                    print("=" * 70 + "\n")
+
+                    _emit_stream_status(status_text="Awaiting your approval to create tasks...", tool_called=tool_name, caller="DB Write agent")
+
+                    # Pause graph execution and wait for user approval card interaction
+                    resume_response = interrupt(interrupt_payload)
+
+                    print("\n" + "=" * 70)
+                    print(f"[HITL GRAPH_RESUME] ✅ TASK APPROVAL RECEIVED & GRAPH RESUMED!")
+                    print(f"[HITL RESUME DATA RECEIVED]\n{json.dumps(resume_response, indent=2) if isinstance(resume_response, dict) else resume_response}")
+                    print("=" * 70 + "\n")
+
+                    if isinstance(resume_response, dict) and resume_response.get("action") == "cancel":
+                        lines.append(f"- **Task Creation**: ❌ Cancelled by user.")
+                    else:
+                        edits = resume_response.get("edits") if isinstance(resume_response, dict) else None
+                        final_tasks = edits if isinstance(edits, list) and edits else task_items_preview
+                        tasks_for_convex = [
+                            {
+                                "title": t.get("title", "Task").replace("named-", "").strip(),
+                                "description": t.get("description", "") or "",
+                                "priority": t.get("priority", "medium"),
+                            }
+                            for t in final_tasks
+                        ]
+                        write_res = await write_bulk_tasks_to_convex({"projectId": project_id, "tasks": tasks_for_convex})
+                        print(f"[HITL WRITE RESULT] Convex bulkInsertTasks response: {write_res}")
+                        lines.append(f"- **Task Creation Status**: {write_res} ({len(tasks_for_convex)} task(s) created in project)")
+
+                # ── 2. Handle Issue Creation HITL Interrupt ─────────────────
+                elif extracted.is_issue_creation and extracted.issues:
+                    issue_items_preview = [
+                        {
+                            "title": iss.title.replace("named-", "").strip(),
+                            "description": iss.description if (iss.description and not iss.description.startswith("Issue logged")) else "",
+                            "priority": iss.priority if iss.priority in ["high", "medium", "low"] else "medium",
+                        }
+                        for iss in extracted.issues
+                    ]
+                    tool_name = "bulk_create_issues" if len(issue_items_preview) > 1 else "create_issue"
+                    interrupt_payload = {
+                        "tool": tool_name,
+                        "message": f"Review and approve {len(issue_items_preview)} issue(s) to create:",
+                        "preview": {
+                            "type": "issue",
+                            "issues": issue_items_preview,
+                        },
+                    }
+
+                    print("\n" + "=" * 70)
+                    print(f"[HITL GRAPH_INTERRUPT] 🛑 PAUSING GRAPH FOR ISSUE CREATION APPROVAL")
+                    print(f"[HITL TOOL NAME] {tool_name}")
+                    print(f"[HITL PREVIEW CONTENT] Payload:\n{json.dumps(interrupt_payload, indent=2)}")
+                    print("=" * 70 + "\n")
+
+                    _emit_stream_status(status_text="Awaiting your approval to create issues...", tool_called=tool_name, caller="DB Write agent")
+
+                    resume_response = interrupt(interrupt_payload)
+
+                    print("\n" + "=" * 70)
+                    print(f"[HITL GRAPH_RESUME] ✅ ISSUE APPROVAL RECEIVED & GRAPH RESUMED!")
+                    print(f"[HITL RESUME DATA RECEIVED]\n{json.dumps(resume_response, indent=2) if isinstance(resume_response, dict) else resume_response}")
+                    print("=" * 70 + "\n")
+
+                    if isinstance(resume_response, dict) and resume_response.get("action") == "cancel":
+                        lines.append(f"- **Issue Creation**: ❌ Cancelled by user.")
+                    else:
+                        edits = resume_response.get("edits") if isinstance(resume_response, dict) else None
+                        final_issues = edits if isinstance(edits, list) and edits else issue_items_preview
+                        issues_for_convex = [
+                            {
+                                "title": i.get("title", "Issue").replace("named-", "").strip(),
+                                "description": i.get("description", "") or "",
+                                "priority": i.get("priority", "medium"),
+                                "severity": "medium",
+                            }
+                            for i in final_issues
+                        ]
+                        write_res = await write_bulk_issues_to_convex({"projectId": project_id, "issues": issues_for_convex})
+                        print(f"[HITL WRITE RESULT] Convex bulkInsertIssues response: {write_res}")
+                        lines.append(f"- **Issue Creation Status**: {write_res} ({len(issues_for_convex)} issue(s) created in project)")
+
+                # ── 3. Handle Calendar Event HITL Interrupt ─────────────────
+                elif extracted.is_calendar_event and extracted.calendar_event:
+                    cal = extracted.calendar_event
+                    start_iso = cal.start_iso or datetime.now().strftime("%Y-%m-%dT10:00:00")
+                    end_iso = cal.end_iso or datetime.now().strftime("%Y-%m-%dT11:00:00")
+                    interrupt_payload = {
+                        "tool": "create_calendar_event",
+                        "message": "Review and confirm calendar event:",
+                        "preview": {
+                            "title": cal.title,
+                            "description": cal.description or "Scheduled via Kaya PM",
+                            "type": cal.event_type if cal.event_type in ["event", "milestone"] else "event",
+                            "start": start_iso,
+                            "end": end_iso,
+                            "allDay": cal.all_day or False,
+                        },
+                    }
+
+                    print("\n" + "=" * 70)
+                    print(f"[HITL GRAPH_INTERRUPT] 🛑 PAUSING GRAPH FOR CALENDAR EVENT APPROVAL")
+                    print(f"[HITL TOOL NAME] create_calendar_event")
+                    print(f"[HITL PREVIEW CONTENT] Payload:\n{json.dumps(interrupt_payload, indent=2)}")
+                    print("=" * 70 + "\n")
+
+                    _emit_stream_status(status_text="Awaiting your approval to schedule calendar event...", tool_called="create_calendar_event", caller="DB Write agent")
+
+                    resume_response = interrupt(interrupt_payload)
+
+                    print("\n" + "=" * 70)
+                    print(f"[HITL GRAPH_RESUME] ✅ CALENDAR APPROVAL RECEIVED & GRAPH RESUMED!")
+                    print(f"[HITL RESUME DATA RECEIVED]\n{json.dumps(resume_response, indent=2) if isinstance(resume_response, dict) else resume_response}")
+                    print("=" * 70 + "\n")
+
+                    if isinstance(resume_response, dict) and resume_response.get("action") == "cancel":
+                        lines.append(f"- **Calendar Event**: ❌ Cancelled by user.")
+                    else:
+                        preview_data = interrupt_payload["preview"]
+                        if isinstance(resume_response, dict) and resume_response.get("edits"):
+                            preview_data.update(resume_response["edits"])
+                        cal_payload = {
+                            "projectId": project_id,
+                            "userId": user_id,
+                            "title": preview_data["title"],
+                            "description": preview_data["description"],
+                            "eventType": preview_data["type"],
+                            "startISO": preview_data["start"],
+                            "endISO": preview_data["end"],
+                            "allDay": preview_data["allDay"],
+                        }
+                        write_res = await write_calendar_event_to_convex(cal_payload)
+                        print(f"[HITL WRITE RESULT] Convex createCalendarEvent response: {write_res}")
+                        lines.append(f"- **Calendar Event Status**: {write_res}")
+
+            except GraphInterrupt:
+                raise
+            except Exception as extract_err:
+                print(f"[DB WRITE EXTRACT WARNING] {extract_err}")
+
+        if len(lines) == 1:
             lines.append("- **DB Write Status**: Ready for write/mutation commands.")
 
         summary_text = "\n".join(lines)
@@ -432,6 +692,8 @@ async def db_write_worker_node(state: SupervisorState, config: RunnableConfig) -
             "retrieved_memory": [m.get("memory", "") for m in memories if isinstance(m, dict)],
         }
 
+    except GraphInterrupt:
+        raise
     except Exception as e:
         error_msg = f"DB Write Sub-Agent encountered an error: {e}"
         print(f"[DB WRITE WORKER ERROR] {error_msg}")
@@ -505,6 +767,8 @@ async def sprint_worker_node(state: SupervisorState, config: RunnableConfig) -> 
             "sprint_insights": sprint_data,
         }
 
+    except GraphInterrupt:
+        raise
     except Exception as e:
         error_msg = f"Sprint Sub-Agent encountered an error: {e}"
         print(f"[SPRINT WORKER ERROR] {error_msg}")
@@ -562,6 +826,8 @@ async def mcp_worker_node(state: SupervisorState, config: RunnableConfig) -> Dic
             "_mcp_messages": [RESET_SENTINEL, {"role": "mcp", "content": summary}],
             "mcp_insights": mcp_result,
         }
+    except GraphInterrupt:
+        raise
     except Exception as e:
         error_msg = f"MCP Sub-Agent encountered an error: {e}"
         print(f"[MCP WORKER ERROR] {error_msg}")
@@ -719,9 +985,12 @@ YOUR PERSONA & STANDARDS:
 1. Executive PM Tone: Speak with crisp, authoritative, supportive professionalism. Avoid generic fluff, filler phrases, or introductory throat-clearing.
 2. Temporal Grounding & Proximity: Today is {current_date}. The target deadline is {deadline_text}. Use these real-world temporal anchors to evaluate timeline urgency, overdue risks, and sprint momentum without hallucinating dates.
 3. Strict Privacy & Zero Raw IDs: NEVER output, mention, or leak alphanumeric database IDs (such as 'kn71qtgem...' or 'nd7088...'). Use only the real project name ('{project_name}'), user name ('{user_name}'), and actual task/issue titles.
-4. Structured & Data-Driven: Ground your analysis strictly in the sub-agent findings below. Use clean Markdown bullet points, bold key terms, and mini tables where helpful.
-5. Capabilities: You help the team manage projects to meet deadlines, track progress, balance workloads, manage Sprints, create calendar events, prioritize backlogs, configure automated schedulers, and seamlessly coordinate connected third-party tools (Jira, Linear, Slack, Notion, Calendly).
-6. STRICT ZERO-HALLUCINATION & GROUND-TRUTH RULE: Under NO circumstances should you fabricate, simulate, or invent tasks, issues, ticket keys, epics, bug titles, or member assignments that are not present in the SUB-AGENT WORKER DATA. If an integration (e.g. Linear, Jira) returns 0 items or returns an error/unauthorized status, explicitly inform the user of that exact status and advise them to reconnect in the Integrations tab. Never invent placeholder tickets.
+4. MANDATORY MARKDOWN TABLES FOR ISSUES, TASKS & SPRINTS:
+   - When presenting issues (Linear, Jira, internal), tasks, or sprint backlogs/metrics, you MUST format them in a clear, professional Markdown Table (e.g. Columns: `| Key / Title | Status | Priority | Assignee | Labels / Branch | Link |` for Linear/Jira issues; `| Task Title | Status | Priority | Assignee | Due Date |` for Tasks; `| Sprint Name | Status | Velocity / Points | Target Date |` for Sprints).
+   - Only use bullet lists for brief high-level summaries or when tabular layout is not applicable.
+5. Structured & Data-Driven: Ground your analysis strictly in the sub-agent findings below.
+6. Capabilities: You help the team manage projects to meet deadlines, track progress, balance workloads, manage Sprints, create calendar events, prioritize backlogs, configure automated schedulers, and seamlessly coordinate connected third-party tools (Jira, Linear, Slack, Notion, Calendly).
+7. STRICT ZERO-HALLUCINATION & GROUND-TRUTH RULE: Under NO circumstances should you fabricate, simulate, or invent tasks, issues, ticket keys, epics, bug titles, or member assignments that are not present in the SUB-AGENT WORKER DATA. If an integration (e.g. Linear, Jira) returns 0 items or returns an error/unauthorized status, explicitly inform the user of that exact status and advise them to reconnect in the Integrations tab. Never invent placeholder tickets.
 
 SUB-AGENT WORKER DATA:
 {findings_prompt}
@@ -731,6 +1000,10 @@ SUB-AGENT WORKER DATA:
 
     messages = [SystemMessage(content=system_prompt)] + list(state.get("messages", []))
     response = await llm.ainvoke(messages)
+
+    print("\n" + "=" * 70)
+    print(f"[KAYA FINAL PM SYNTHESIS RESPONSE]\n{response.content}")
+    print("=" * 70 + "\n")
 
     return {"messages": [response]}
 

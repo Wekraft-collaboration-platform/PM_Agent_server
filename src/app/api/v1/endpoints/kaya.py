@@ -4,6 +4,7 @@ from typing import AsyncGenerator
 from fastapi import APIRouter, Request, HTTPException
 from langchain_core.messages import HumanMessage
 from langgraph.types import Command
+from langgraph.errors import GraphInterrupt
 from sse_starlette.sse import EventSourceResponse
 
 from app.agents.graph.kaya_graph import kaya_graph
@@ -209,6 +210,7 @@ async def kaya_agent_endpoint(request: Request):
                     elif debug_type == "task_result":
                         interrupts = chunk_data["payload"].get("interrupts", [])
                         if interrupts:
+                            print(f"[/kaya INTERRUPT STREAMED] Found {len(interrupts)} interrupt(s): {interrupts}")
                             yield interrupt_event(interrupts)
 
                 elif chunk_type == "messages":
@@ -223,9 +225,16 @@ async def kaya_agent_endpoint(request: Request):
             # Mark completion
             yield custom_event({"status": "completed", "thread_id": thread_id, "agent": "kaya"})
 
+        except GraphInterrupt:
+            print(f"[/kaya STREAM] Graph paused by GraphInterrupt (awaiting user approval).")
+            yield custom_event({"status": "awaiting_approval", "thread_id": thread_id, "agent": "kaya"})
         except Exception as e:
-            print(f"[/kaya STREAM ERROR] {e}")
-            yield error_event(str(e))
+            if "Interrupt" in type(e).__name__ or "GraphInterrupt" in str(e):
+                print(f"[/kaya STREAM] Graph paused by GraphInterrupt.")
+                yield custom_event({"status": "awaiting_approval", "thread_id": thread_id, "agent": "kaya"})
+            else:
+                print(f"[/kaya STREAM ERROR] {e}")
+                yield error_event(str(e))
         finally:
             active_connections.pop(thread_id, None)
 

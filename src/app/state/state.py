@@ -75,6 +75,11 @@ class SupervisorState(TypedDict):
     active_error: Optional[str]
     active_errors: Optional[List[str]]
 
+    # 6. Active Intent, Staged Actions & Mutation Receipts
+    active_intent: Optional[str]
+    pending_action_payload: Optional[Dict[str, Any]]
+    mutation_receipt: Optional[Dict[str, Any]]
+
 
 class KayaState(MessagesState):
     """
@@ -110,4 +115,9 @@ class KayaState(MessagesState):
     attached_document: Optional[Dict[str, Any]]
     active_error: Optional[str]
     active_errors: Optional[List[str]]
+
+    # Active Intent, Staged Actions & Mutation Receipts
+    active_intent: Optional[str]
+    pending_action_payload: Optional[Dict[str, Any]]
+    mutation_receipt: Optional[Dict[str, Any]]
 
