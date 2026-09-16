@@ -539,7 +539,7 @@ async def mcp_worker_node(state: SupervisorState, config: RunnableConfig) -> Dic
         executed_tools = mcp_result.get("executed_tools", [])
 
         for t_name in executed_tools:
-            _emit_stream_status(tool_called=t_name, caller="MCP Integrations Agent")
+            _emit_stream_status(tool_called=t_name, caller="MCP Agent")
 
         return {
             "_mcp_messages": [RESET_SENTINEL, {"role": "mcp", "content": summary}],
