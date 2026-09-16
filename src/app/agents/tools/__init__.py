@@ -25,6 +25,11 @@ from app.agents.tools.tools import (
     convex_post_async,
     convex_post_sync,
 )
+from app.agents.tools.mcp_client import (
+    fetch_project_mcp_connections_async,
+    smart_prune_connectors,
+    execute_mcp_agent_workflow,
+)
 
 __all__ = [
     "ALL_TOOLS",
@@ -52,4 +57,8 @@ __all__ = [
     "write_bulk_issues_to_convex",
     "convex_post_async",
     "convex_post_sync",
+    "fetch_project_mcp_connections_async",
+    "smart_prune_connectors",
+    "execute_mcp_agent_workflow",
 ]
+

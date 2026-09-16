@@ -54,6 +54,7 @@ from app.agents.tools.tools import (
     write_bulk_tasks_to_convex,
     write_bulk_issues_to_convex,
 )
+from app.agents.tools.mcp_client import execute_mcp_agent_workflow
 
 load_dotenv(override=True)
 
@@ -67,6 +68,7 @@ class SupervisorDecision(BaseModel):
     actions: List[str] = Field(
         description=(
             "List of sub-agent actions to trigger in parallel (can select 1 or multiple):\n"
+            "- 'mcp': third-party tool integrations (Slack messages/channels, Calendly scheduling/availability, Linear issues/cycles, Notion docs/PRDs)\n"
             "- 'db_write': user memory search (Mem0), calendar events, report scheduler setup, or bulk task creation\n"
             "- 'analyst': task/issue summaries, daily standup, member workloads, project insights/deadlines\n"
             "- 'sprint': sprint insights/velocity, sprint creation, or backlog item assignments\n"
@@ -80,13 +82,14 @@ ROUTER_SYSTEM_PROMPT = """You are the primary Supervisor Router for the WEKRAFT 
 Analyze the user's incoming query and decide which specialized sub-agent workers to trigger:
 
 Available Actions:
-1. 'db_write': State mutations or personal memory: Long-term memory search (Mem0), calendar event scheduling, report scheduler setup, or bulk PRD task/issue generation.
-2. 'analyst': Read-only analytics: User daily standup, task summaries, issue tracking, member workloads, project health, or project deadlines/timelines.
-3. 'sprint': Sprint velocity, active sprint progress, sprint creation, or backlog item allocation.
-4. 'direct_response': Greetings (hi, hello), casual conversation, or general questions requiring no live database queries.
+1. 'mcp': Third-party SaaS integrations: Slack channels/messages/posts, Calendly meeting schedules/availability, Linear issue tracking, or Notion PRD/wiki docs.
+2. 'db_write': State mutations or personal memory: Long-term memory search (Mem0), calendar event scheduling, report scheduler setup, or bulk PRD task/issue generation.
+3. 'analyst': Read-only analytics: User daily standup, task summaries, issue tracking, member workloads, project health, or project deadlines/timelines.
+4. 'sprint': Sprint velocity, active sprint progress, sprint creation, or backlog item allocation.
+5. 'direct_response': Greetings (hi, hello), casual conversation, or general questions requiring no live database queries.
 
 Rules:
-- Select MULTIPLE sub-agents if the user query asks for multiple aspects (e.g. 'Show my standup and sprint velocity' -> ['analyst', 'sprint']).
+- Select MULTIPLE sub-agents if the user query asks for multiple aspects (e.g. 'Show my standup and sprint velocity' -> ['analyst', 'sprint'], or 'Check Linear issues and send a Slack update' -> ['mcp']).
 - If the query is just a greeting or general dialogue, choose ONLY ['direct_response'].
 """
 
@@ -191,6 +194,8 @@ async def supervisor_router_node(state: SupervisorState, config: RunnableConfig)
             _emit_stream_status(subagent_called="sprint_agent")
         elif action == "db_write":
             _emit_stream_status(subagent_called="db_write_agent")
+        elif action == "mcp":
+            _emit_stream_status(subagent_called="mcp_agent")
 
     return {
         "next": decision.actions,
@@ -215,6 +220,8 @@ def route_supervisor(state: SupervisorState) -> List[str]:
         target_nodes.append("db_write_node")
     if "sprint" in actions:
         target_nodes.append("sprint_node")
+    if "mcp" in actions:
+        target_nodes.append("mcp_node")
 
     return target_nodes if target_nodes else ["kaya_direct_node"]
 
@@ -494,6 +501,63 @@ async def sprint_worker_node(state: SupervisorState, config: RunnableConfig) -> 
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SUB-AGENT 4: MCP INTEGRATIONS WORKER (Slack, Calendly, Linear, Notion, Sentry)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def mcp_worker_node(state: SupervisorState, config: RunnableConfig) -> Dict[str, Any]:
+    """
+    MCP Sub-Agent:
+    - Dynamically retrieves active connected SaaS apps & decrypted tokens from Convex.
+    - Employs Smart Tool Pruning based on user query intent (Slack, Calendly, Linear, Notion, Sentry).
+    - Executes MCP tools with timeouts and HITL awareness.
+    - Normalized into structured Markdown findings in _mcp_messages.
+    - Zero cascading failures via try/except isolation.
+    """
+    _emit_stream_status(status_text="MCP Agent querying connected apps (Slack, Calendly, Linear, Notion)...")
+    project_id = state.get("project_id") or ""
+    user_name = state.get("user_name") or ""
+    messages = state.get("messages", [])
+    user_query = _get_latest_user_text(messages)
+
+    if not project_id:
+        return {
+            "_mcp_messages": [
+                RESET_SENTINEL,
+                {"role": "mcp", "content": "⚠️ No active project selected. Cannot query MCP connectors."},
+            ]
+        }
+
+    try:
+        # Execute MCP agent workflow with smart pruning and live token fetching
+        mcp_result = await execute_mcp_agent_workflow(
+            project_id=project_id,
+            user_query=user_query,
+            user_name=user_name,
+        )
+
+        summary = mcp_result.get("summary", "No MCP data retrieved.")
+        executed_tools = mcp_result.get("executed_tools", [])
+
+        for t_name in executed_tools:
+            _emit_stream_status(tool_called=t_name, caller="MCP Integrations Agent")
+
+        return {
+            "_mcp_messages": [RESET_SENTINEL, {"role": "mcp", "content": summary}],
+            "mcp_insights": mcp_result,
+        }
+    except Exception as e:
+        error_msg = f"MCP Sub-Agent encountered an error: {e}"
+        print(f"[MCP WORKER ERROR] {error_msg}")
+        return {
+            "_mcp_messages": [
+                RESET_SENTINEL,
+                {"role": "mcp", "content": f"⚠️ [MCP Integrations Notice]: {error_msg}"},
+            ],
+            "active_error": error_msg,
+        }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 4. KAYA SYNTHESIZER & DIRECT NODES (Only Kaya streams tokens to user)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -587,7 +651,7 @@ YOUR OPERATING PRINCIPLES:
 async def kaya_synthesizer_node(state: SupervisorState, config: RunnableConfig) -> Dict[str, Any]:
     """
     Kaya Synthesizer Node:
-    - Ingests all sub-agent worker outputs (_analyst_messages, _db_write_messages, _sprint_messages).
+    - Ingests all sub-agent worker outputs (_analyst_messages, _db_write_messages, _sprint_messages, _mcp_messages).
     - Injects project details, deadline awareness, and current date.
     - Synthesizes findings using gpt-4.1-mini, streaming executive PM tokens to user.
     """
@@ -606,12 +670,13 @@ async def kaya_synthesizer_node(state: SupervisorState, config: RunnableConfig) 
     else:
         deadline_text = "No deadline currently set"
 
-    # Collect findings from sub-agents
+    # Collect findings from all sub-agents (Internal DB + External MCP integrations)
     findings_blocks = []
     for key, label in [
         ("_analyst_messages", "ANALYST FINDINGS"),
         ("_db_write_messages", "MEMORY & WRITE ACTIONS"),
         ("_sprint_messages", "SPRINT FINDINGS"),
+        ("_mcp_messages", "THIRD-PARTY MCP INTEGRATION FINDINGS (Slack, Calendly, Linear, Notion)"),
     ]:
         msgs = state.get(key, [])
         if msgs:
@@ -638,7 +703,7 @@ YOUR PERSONA & STANDARDS:
 2. Temporal Grounding & Proximity: Today is {current_date}. The target deadline is {deadline_text}. Use these real-world temporal anchors to evaluate timeline urgency, overdue risks, and sprint momentum without hallucinating dates.
 3. Strict Privacy & Zero Raw IDs: NEVER output, mention, or leak alphanumeric database IDs (such as 'kn71qtgem...' or 'nd7088...'). Use only the real project name ('{project_name}'), user name ('{user_name}'), and actual task/issue titles.
 4. Structured & Data-Driven: Ground your analysis strictly in the sub-agent findings below. Use clean Markdown bullet points, bold key terms, and mini tables where helpful.
-5. You can help Team manage Projects to avoid deadlines , tell about project progress , Team workloads , creation of Tasks and Issues , Sprints , Create calendar events and help prioritize work and create automated schedulers.
+5. You can help Team manage Projects to avoid deadlines, tell about project progress, Team workloads, creation of Tasks and Issues, Sprints, Create calendar events, help prioritize work, create automated schedulers, and seamlessly coordinate across connected third-party tools (Slack, Calendly, Linear, Notion).
 
 SUB-AGENT WORKER DATA:
 {findings_prompt}
@@ -661,12 +726,13 @@ def build_kaya_graph():
     """Builds and compiles the master Kaya multi-agent LangGraph workflow."""
     workflow = StateGraph(SupervisorState)
 
-    # Add Nodes
+    # Add Nodes (All 4 Sub-Agents + Direct + Synthesizer)
     workflow.add_node("supervisor_router_node", supervisor_router_node)
     workflow.add_node("kaya_direct_node", kaya_direct_node)
     workflow.add_node("analyst_node", analyst_worker_node)
     workflow.add_node("db_write_node", db_write_worker_node)
     workflow.add_node("sprint_node", sprint_worker_node)
+    workflow.add_node("mcp_node", mcp_worker_node)
     workflow.add_node("kaya_synthesizer_node", kaya_synthesizer_node)
 
     # Edge: Start -> Router
@@ -676,21 +742,22 @@ def build_kaya_graph():
     workflow.add_conditional_edges(
         "supervisor_router_node",
         route_supervisor,
-        ["kaya_direct_node", "analyst_node", "db_write_node", "sprint_node"],
+        ["kaya_direct_node", "analyst_node", "db_write_node", "sprint_node", "mcp_node"],
     )
 
     # Direct Response terminates directly
     workflow.add_edge("kaya_direct_node", END)
 
-    # Fan-In: All Sub-Agent Workers converge into Kaya Synthesizer
+    # Fan-In: All 4 Sub-Agent Workers converge into Kaya Synthesizer
     workflow.add_edge("analyst_node", "kaya_synthesizer_node")
     workflow.add_edge("db_write_node", "kaya_synthesizer_node")
     workflow.add_edge("sprint_node", "kaya_synthesizer_node")
+    workflow.add_edge("mcp_node", "kaya_synthesizer_node")
 
     # Synthesizer terminates at END
     workflow.add_edge("kaya_synthesizer_node", END)
 
-    # Checkpointer for durable execution & HITL resumes
+    # Checkpointer for durable execution & HITL resumes (Redis checkpointer)
     checkpointer = get_checkpointer()
     compiled_graph = workflow.compile(checkpointer=checkpointer)
     print("[KAYA GRAPH] Master Supervisor & Multi-Agent Graph compiled successfully.")
@@ -699,3 +766,4 @@ def build_kaya_graph():
 
 # Expose singleton compiled graph
 kaya_graph = build_kaya_graph()
+

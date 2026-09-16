@@ -61,12 +61,15 @@ class SupervisorState(TypedDict):
     _analyst_tool_call_id: Optional[str]
     _db_write_messages: Annotated[List[Any], reset_or_add]
     _sprint_messages: Annotated[List[Any], reset_or_add]
+    _mcp_messages: Annotated[List[Any], reset_or_add]
+    _mcp_tool_call_id: Optional[str]
 
     # 5. Shared Memory & Context Bus (Mem0, Semantic Cache, Tool Outputs, Document Attachments)
     retrieved_memory: Optional[List[str]]
     standup_data: Optional[Dict[str, Any]]
     sprint_insights: Optional[Dict[str, Any]]
     project_insights: Optional[Dict[str, Any]]
+    mcp_insights: Optional[Dict[str, Any]]
     file_id: Optional[str]
     attached_document: Optional[Dict[str, Any]]
     active_error: Optional[str]
@@ -94,13 +97,17 @@ class KayaState(MessagesState):
     _analyst_tool_call_id: Optional[str]
     _db_write_messages: Annotated[List[Any], reset_or_add]
     _sprint_messages: Annotated[List[Any], reset_or_add]
+    _mcp_messages: Annotated[List[Any], reset_or_add]
+    _mcp_tool_call_id: Optional[str]
 
     # Shared Context & Cache
     retrieved_memory: Optional[List[str]]
     standup_data: Optional[Dict[str, Any]]
     sprint_insights: Optional[Dict[str, Any]]
     project_insights: Optional[Dict[str, Any]]
+    mcp_insights: Optional[Dict[str, Any]]
     file_id: Optional[str]
     attached_document: Optional[Dict[str, Any]]
     active_error: Optional[str]
     active_errors: Optional[List[str]]
+
