@@ -68,9 +68,9 @@ class SupervisorDecision(BaseModel):
     actions: List[str] = Field(
         description=(
             "List of sub-agent actions to trigger in parallel (can select 1 or multiple):\n"
-            "- 'mcp': third-party tool integrations (Slack messages/channels, Calendly scheduling/availability, Linear issues/cycles, Notion docs/PRDs)\n"
+            "- 'mcp': third-party SaaS tool integrations (Jira tickets/issues/sprints, Linear issues/cycles, Slack messages/channels, Calendly scheduling/availability, Notion docs/PRDs)\n"
             "- 'db_write': user memory search (Mem0), calendar events, report scheduler setup, or bulk task creation\n"
-            "- 'analyst': task/issue summaries, daily standup, member workloads, project insights/deadlines\n"
+            "- 'analyst': internal project database analytics: user daily standup, task summaries, issue tracking, member workloads, project health, deadlines\n"
             "- 'sprint': sprint insights/velocity, sprint creation, or backlog item assignments\n"
             "- 'direct_response': simple greeting, casual conversation, or general product manager chat"
         )
@@ -82,20 +82,22 @@ ROUTER_SYSTEM_PROMPT = """You are the primary Supervisor Router for the WEKRAFT 
 Analyze the user's incoming query and decide which specialized sub-agent workers to trigger:
 
 Available Actions:
-1. 'mcp': Third-party SaaS integrations: Slack channels/messages/posts, Calendly meeting schedules/availability, Linear issue tracking, or Notion PRD/wiki docs.
+1. 'mcp': Third-party SaaS integrations: Jira issues/tickets/epics/sprints, Linear issue tracking/cycles, Slack channels/messages/posts, Calendly meeting schedules/availability, or Notion PRD/wiki docs.
 2. 'db_write': State mutations or personal memory: Long-term memory search (Mem0), calendar event scheduling, report scheduler setup, or bulk PRD task/issue generation.
-3. 'analyst': Read-only analytics: User daily standup, task summaries, issue tracking, member workloads, project health, or project deadlines/timelines.
+3. 'analyst': Internal read-only analytics: User daily standup, task summaries, issue tracking, member workloads, project health, or project deadlines/timelines.
 4. 'sprint': Sprint velocity, active sprint progress, sprint creation, or backlog item allocation.
 5. 'direct_response': Greetings (hi, hello), casual conversation, or general questions requiring no live database queries.
 
 Rules:
-- Select MULTIPLE sub-agents if the user query asks for multiple aspects (e.g. 'Show my standup and sprint velocity' -> ['analyst', 'sprint'], or 'Check Linear issues and send a Slack update' -> ['mcp']).
+- If the user query mentions or asks about Jira, Linear, Slack, Calendly, Notion, external tickets, integrations, or MCP tools, you MUST include 'mcp' in actions.
+- If the user asks for project tasks, issues, tracking, or sprint status, and mentions or implies connected tools (e.g. Jira, Linear), select BOTH ['analyst', 'mcp'].
+- Select MULTIPLE sub-agents if the user query asks for multiple aspects (e.g. 'Show my standup and Jira issues' -> ['analyst', 'mcp'], 'Check Linear issues and send a Slack update' -> ['mcp']).
 - If the query is just a greeting or general dialogue, choose ONLY ['direct_response'].
 """
 
 
 async def route_user_request(user_input: str, project_id: Optional[str] = None) -> SupervisorDecision:
-    """Evaluates user input using Groq LLM router and outputs structured SupervisorDecision."""
+    """Evaluates user input using Groq LLM router and outputs structured SupervisorDecision with deterministic safeguards."""
     groq_api_key = os.getenv("GROQ_API_KEY", "")
     router_model = os.getenv("GROQ_ROUTER_MODEL", "openai/gpt-oss-120b")
 
@@ -117,6 +119,17 @@ async def route_user_request(user_input: str, project_id: Optional[str] = None) 
         # Ensure fallback if actions is empty
         if not decision.actions:
             decision.actions = ["direct_response"]
+
+        # Deterministic safeguard: if user explicitly mentions any MCP tool/integration keyword, guarantee 'mcp' is included
+        mcp_keywords = ["jira", "linear", "slack", "calendly", "notion", "mcp", "integration", "ticket", "external", "atlassian"]
+        lower_query = user_input.lower()
+        if any(k in lower_query for k in mcp_keywords):
+            if "mcp" not in decision.actions:
+                if "direct_response" in decision.actions:
+                    decision.actions.remove("direct_response")
+                decision.actions.append("mcp")
+                decision.reasoning += " (MCP auto-included due to keyword match)"
+
         safe_reasoning = decision.reasoning.encode("ascii", "replace").decode("ascii")
         print(f"[ROUTER DECISION] Actions: {decision.actions} | Reasoning: {safe_reasoning}")
         return decision
@@ -124,9 +137,13 @@ async def route_user_request(user_input: str, project_id: Optional[str] = None) 
     except Exception as e:
         safe_err = str(e).encode("ascii", "replace").decode("ascii")
         print(f"[ROUTER WARNING] Fallback routing due to: {safe_err}")
+        actions = ["direct_response"]
+        mcp_keywords = ["jira", "linear", "slack", "calendly", "notion", "mcp", "integration", "ticket", "external", "atlassian"]
+        if any(k in user_input.lower() for k in mcp_keywords):
+            actions = ["mcp"]
         return SupervisorDecision(
-            actions=["direct_response"],
-            reasoning=f"Fallback routing due to LLM error: {safe_err}",
+            actions=actions,
+            reasoning=f"Fallback routing: {safe_err}",
         )
 
 
@@ -703,7 +720,8 @@ YOUR PERSONA & STANDARDS:
 2. Temporal Grounding & Proximity: Today is {current_date}. The target deadline is {deadline_text}. Use these real-world temporal anchors to evaluate timeline urgency, overdue risks, and sprint momentum without hallucinating dates.
 3. Strict Privacy & Zero Raw IDs: NEVER output, mention, or leak alphanumeric database IDs (such as 'kn71qtgem...' or 'nd7088...'). Use only the real project name ('{project_name}'), user name ('{user_name}'), and actual task/issue titles.
 4. Structured & Data-Driven: Ground your analysis strictly in the sub-agent findings below. Use clean Markdown bullet points, bold key terms, and mini tables where helpful.
-5. You can help Team manage Projects to avoid deadlines, tell about project progress, Team workloads, creation of Tasks and Issues, Sprints, Create calendar events, help prioritize work, create automated schedulers, and seamlessly coordinate across connected third-party tools (Slack, Calendly, Linear, Notion).
+5. Capabilities: You help the team manage projects to meet deadlines, track progress, balance workloads, manage Sprints, create calendar events, prioritize backlogs, configure automated schedulers, and seamlessly coordinate connected third-party tools (Jira, Linear, Slack, Notion, Calendly).
+6. STRICT ZERO-HALLUCINATION & GROUND-TRUTH RULE: Under NO circumstances should you fabricate, simulate, or invent tasks, issues, ticket keys, epics, bug titles, or member assignments that are not present in the SUB-AGENT WORKER DATA. If an integration (e.g. Linear, Jira) returns 0 items or returns an error/unauthorized status, explicitly inform the user of that exact status and advise them to reconnect in the Integrations tab. Never invent placeholder tickets.
 
 SUB-AGENT WORKER DATA:
 {findings_prompt}

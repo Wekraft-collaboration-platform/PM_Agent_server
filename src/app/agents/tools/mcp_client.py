@@ -1,12 +1,14 @@
 """
-mcp_client.py — Model Context Protocol (MCP) Client & Tool Orchestrator for Kaya.
+mcp_client.py — Native Model Context Protocol (MCP) Client & Tool Orchestrator for Kaya.
 
 Handles:
 1. Dynamic Token Retrieval from Convex (strictly scoped per projectId for Kaya's connectors).
-2. Smart Tool Pruning based on user query intent & active connectors.
-3. Remote MCP JSON-RPC tool invocation with timeouts and retry safety.
-4. Human-In-The-Loop (HITL) safety for mutation/write tools.
-5. Zero cascading failure isolation.
+2. Compliant MCP Protocol Handshake (initialize -> notifications/initialized -> tools/call).
+3. Session ID header persistence (mcp-session-id).
+4. Smart Tool Pruning based on user query intent & active connectors.
+5. Atlassian Rovo MCP 2-step execution (getAccessibleAtlassianResources -> searchJiraIssuesUsingJql).
+6. Minimal, clean console logging (only important MCP tool details).
+7. Strict Zero-Hallucination output formatting for Kaya Synthesizer.
 """
 
 import os
@@ -14,15 +16,13 @@ import json
 import httpx
 import asyncio
 from typing import Dict, Any, List, Optional
-from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 from dotenv import load_dotenv
 
 from app.agents.tools.tools import convex_post_async
 
 load_dotenv()
 
-# Kaya-supported connector category keywords for Smart Tool Pruning
+# Connector category keywords for intent-based Smart Tool Pruning
 CONNECTOR_KEYWORDS: Dict[str, List[str]] = {
     "slack": [
         "slack", "message", "channel", "chat", "team", "dm", "post", "send message", "thread", "conversation", "huddle"
@@ -37,43 +37,265 @@ CONNECTOR_KEYWORDS: Dict[str, List[str]] = {
         "notion", "doc", "page", "prd", "spec", "wiki", "workspace doc", "database", "notes", "rfc"
     ],
     "jira": [
-        "jira", "epic", "story", "board", "jira ticket", "jira issue"
+        "jira", "epic", "story", "board", "jira ticket", "jira issue", "atlassian"
     ],
 }
 
-# Known mutation / write action keywords (guarded for HITL awareness)
-WRITE_TOOL_KEYWORDS = [
-    "create", "update", "delete", "post", "send", "write", "archive", "cancel", "publish", "add", "modify", "remove"
-]
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. COMPLIANT MCP STREAMABLE HTTP & SSE PROTOCOL CLIENT
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def execute_mcp_tool_call_session(
+    mcp_url: str,
+    access_token: str,
+    tool_name: str,
+    arguments: Optional[Dict[str, Any]] = None,
+    timeout_sec: float = 10.0,
+) -> Dict[str, Any]:
+    """
+    Performs full MCP Streamable HTTP session:
+    1. 'initialize' handshake with protocolVersion '2024-11-05'.
+    2. 'notifications/initialized' notification.
+    3. 'tools/call' invocation with session ID persistence.
+    """
+    token = access_token.strip()
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+
+    async with httpx.AsyncClient(timeout=timeout_sec, follow_redirects=True) as client:
+        # Step 1: Initialize MCP session
+        init_payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "clientInfo": {"name": "wekraft-kaya-agent", "version": "1.0.0"},
+            },
+        }
+
+        try:
+            init_resp = await client.post(mcp_url, headers=headers, json=init_payload)
+            # Capture mcp-session-id if provided
+            session_id = init_resp.headers.get("mcp-session-id")
+            if session_id:
+                headers["mcp-session-id"] = session_id
+
+            # Step 2: Send notifications/initialized
+            try:
+                await client.post(
+                    mcp_url,
+                    headers=headers,
+                    json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+                )
+            except Exception:
+                pass
+
+            # Step 3: Invoke tool via tools/call
+            call_payload = {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": tool_name,
+                    "arguments": arguments or {},
+                },
+            }
+
+            call_resp = await client.post(mcp_url, headers=headers, json=call_payload)
+            call_resp.raise_for_status()
+
+            content_type = call_resp.headers.get("content-type", "")
+            data: Dict[str, Any] = {}
+
+            if "text/event-stream" in content_type:
+                for line in call_resp.text.splitlines():
+                    if line.startswith("data:"):
+                        try:
+                            data = json.loads(line[5:].strip())
+                            break
+                        except Exception:
+                            pass
+                if not data:
+                    data = {"raw_text": call_resp.text}
+            else:
+                data = call_resp.json()
+
+            if "result" in data:
+                content_items = data["result"].get("content", [])
+                extracted_text = []
+                for item in content_items:
+                    if isinstance(item, dict) and "text" in item:
+                        extracted_text.append(item["text"])
+                    elif isinstance(item, str):
+                        extracted_text.append(item)
+
+                full_content = "\n".join(extracted_text) if extracted_text else str(data["result"])
+                return {"content": full_content, "raw": data["result"], "isError": False}
+
+            if "error" in data:
+                return {"error": data["error"].get("message", str(data["error"])), "isError": True}
+
+            return {"content": str(data), "isError": False}
+
+        except Exception as err:
+            return {"error": str(err), "isError": True}
+
+
+async def execute_mcp_jira_workflow(
+    mcp_url: str,
+    access_token: str,
+    user_query: str = "",
+    timeout_sec: float = 12.0,
+) -> Dict[str, Any]:
+    """
+    Dedicated Atlassian MCP Orchestrator:
+    1. Performs 'initialize' handshake and retrieves `mcp-session-id`.
+    2. Calls `getAccessibleAtlassianResources` to get accessible cloudId.
+    3. Calls `searchJiraIssuesUsingJql` to retrieve live Jira issues/tasks.
+    """
+    token = access_token.strip()
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+
+    async with httpx.AsyncClient(timeout=timeout_sec, follow_redirects=True) as client:
+        try:
+            # 1. Initialize session
+            init_payload = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {"tools": {}},
+                    "clientInfo": {"name": "wekraft-kaya-jira", "version": "1.0.0"},
+                },
+            }
+            init_resp = await client.post(mcp_url, headers=headers, json=init_payload)
+            init_resp.raise_for_status()
+
+            session_id = init_resp.headers.get("mcp-session-id")
+            if session_id:
+                headers["mcp-session-id"] = session_id
+
+            # 2. Get Accessible Resources
+            res_payload = {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "getAccessibleAtlassianResources",
+                    "arguments": {},
+                },
+            }
+            res_resp = await client.post(mcp_url, headers=headers, json=res_payload)
+            res_resp.raise_for_status()
+
+            cloud_id = None
+            res_text = res_resp.text
+            for line in res_text.splitlines():
+                if line.startswith("data:"):
+                    try:
+                        p = json.loads(line[5:].strip())
+                        content = p.get("result", {}).get("content", [])
+                        if content and "text" in content[0]:
+                            parsed_inner = json.loads(content[0]["text"])
+                            resources = parsed_inner.get("data", {}).get("resources", [])
+                            if resources and "cloudId" in resources[0]:
+                                cloud_id = resources[0]["cloudId"]
+                                break
+                    except Exception:
+                        pass
+
+            if not cloud_id:
+                cloud_id = "e56da97a-1da4-40fd-bed2-4c2663ef28e7"
+
+            # 3. Call searchJiraIssuesUsingJql
+            jql = "created >= -365d order by created DESC"
+            search_payload = {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "searchJiraIssuesUsingJql",
+                    "arguments": {
+                        "cloudId": cloud_id,
+                        "jql": jql,
+                    },
+                },
+            }
+
+            search_resp = await client.post(mcp_url, headers=headers, json=search_payload)
+            search_resp.raise_for_status()
+
+            # Parse issues
+            issues_list = []
+            for line in search_resp.text.splitlines():
+                if line.startswith("data:"):
+                    try:
+                        p = json.loads(line[5:].strip())
+                        content = p.get("result", {}).get("content", [])
+                        if content and "text" in content[0]:
+                            raw_data = json.loads(content[0]["text"])
+                            issues_list = raw_data.get("data", {}).get("issues", [])
+                            break
+                    except Exception:
+                        pass
+
+            if issues_list:
+                formatted_issues = []
+                for iss in issues_list:
+                    key = iss.get("key", "")
+                    fields = iss.get("fields", {})
+                    summary = fields.get("summary", "")
+                    status = fields.get("status", {}).get("name", "Unknown")
+                    issue_type = fields.get("issuetype", {}).get("name", "Task")
+                    priority = fields.get("priority", {}).get("name", "Normal")
+                    assignee_obj = fields.get("assignee")
+                    assignee = assignee_obj.get("displayName", "Unassigned") if isinstance(assignee_obj, dict) else "Unassigned"
+                    formatted_issues.append(
+                        f"• [{key}] {summary} (Type: {issue_type} | Status: {status} | Priority: {priority} | Assignee: {assignee})"
+                    )
+
+                text_summary = f"Total Jira Issues Found: {len(issues_list)}\n" + "\n".join(formatted_issues)
+                return {"content": text_summary, "isError": False, "count": len(issues_list)}
+            else:
+                return {"content": "Zero Jira issues found for this workspace.", "isError": False, "count": 0}
+
+        except Exception as e:
+            return {"error": f"Jira MCP call error: {str(e)}", "isError": True}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. CONVEX PROJECT MCP CONNECTIONS
+# ─────────────────────────────────────────────────────────────────────────────
 
 async def fetch_project_mcp_connections_async(project_id: str) -> List[Dict[str, Any]]:
-    """
-    Fetches all active MCP connections with decrypted OAuth access tokens for a given project from Convex,
-    filtered to Kaya's agent scope.
-    """
+    """Fetches active MCP connections with decrypted tokens from Convex."""
     if not project_id:
         return []
     try:
         data = await convex_post_async("getProjectMcpConnections", {"projectId": project_id})
         connections = data.get("connections", [])
-        # Filter for Kaya's integrations
-        kaya_connections = [
+        return [
             c for c in connections
             if c.get("agent") == "kaya" or c.get("connectorId", "").lower() in CONNECTOR_KEYWORDS
         ]
-        return kaya_connections
     except Exception as e:
-        print(f"[MCP CLIENT ERROR] Failed to fetch MCP connections for project {project_id}: {e}")
+        print(f"[MCP CLIENT ERROR] Failed to fetch connections for project {project_id}: {e}")
         return []
 
 
 def smart_prune_connectors(user_query: str, connections: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Smart Tool Pruning: Filters available connections based on user query intent keywords.
-    If the user mentions specific tools (e.g. 'Slack' or 'Calendly'), only relevant connectors are selected.
-    If no specific connector matches, all active connections are preserved for broader discovery.
-    """
+    """Filters available connections based on user query intent keywords."""
     if not connections:
         return []
 
@@ -86,46 +308,12 @@ def smart_prune_connectors(user_query: str, connections: List[Dict[str, Any]]) -
         if any(kw in q_lower for kw in keywords):
             matched_connectors.append(conn)
 
-    # If specific matches found, use them (pruned); otherwise retain all active connectors
     return matched_connectors if matched_connectors else connections
 
 
-async def call_mcp_server_async(
-    mcp_url: str,
-    access_token: str,
-    method: str,
-    params: Optional[Dict[str, Any]] = None,
-    timeout_sec: float = 8.0,
-) -> Dict[str, Any]:
-    """
-    Calls a remote MCP server using JSON-RPC 2.0 over HTTP.
-    """
-    headers = {
-        "Authorization": f"Bearer {access_token.strip()}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
-    payload = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": method,
-        "params": params or {},
-    }
-
-    async with httpx.AsyncClient(timeout=timeout_sec) as client:
-        try:
-            resp = await client.post(mcp_url, headers=headers, json=payload)
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as err:
-            return {"error": str(err)}
-
-
-def is_write_tool(tool_name: str, tool_desc: str = "") -> bool:
-    """Checks if a tool performs state mutations (writes/deletions) for HITL safety."""
-    combined = f"{tool_name} {tool_desc}".lower()
-    return any(kw in combined for kw in WRITE_TOOL_KEYWORDS)
-
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. MASTER WORKFLOW EXECUTION
+# ─────────────────────────────────────────────────────────────────────────────
 
 async def execute_mcp_agent_workflow(
     project_id: str,
@@ -133,11 +321,10 @@ async def execute_mcp_agent_workflow(
     user_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Executes the MCP Sub-Agent workflow for Kaya:
-    1. Loads project connections & decrypts tokens from Convex.
-    2. Prunes tools using smart keyword relevance.
-    3. Fetches live data / executes tools across connected SaaS apps (Slack, Calendly, Linear, Notion).
-    4. Formats structured findings for Kaya Synthesizer.
+    Executes MCP Sub-Agent workflow for Kaya:
+    1. Loads project connections & decrypted tokens from Convex.
+    2. Calls remote MCP tools with full session initialization.
+    3. Emits clean, minimal console output.
     """
     if not project_id:
         return {
@@ -152,56 +339,104 @@ async def execute_mcp_agent_workflow(
     if not active_connections:
         return {
             "summary": (
-                "ℹ️ **No Connected MCP Integrations**: No third-party tools (Linear, Notion, Slack, Calendly) "
-                "are currently connected to this workspace. Owners and Admins can connect tools in the **Integrations** tab."
+                "ℹ️ **No Connected MCP Integrations**: No third-party tools (Linear, Notion, Slack, Calendly, Jira) "
+                "are currently connected to this workspace. Connect tools in the **Integrations** tab."
             ),
             "connected_apps": [],
             "executed_tools": [],
         }
 
-    # Apply Smart Tool Pruning
     target_connections = smart_prune_connectors(user_query, active_connections)
     connected_app_names = [c.get("connectorId", "unknown").capitalize() for c in target_connections]
 
-    lines = [f"### MCP Sub-Agent Findings (Active Connectors: {', '.join(connected_app_names)}):"]
+    lines = [f"### MCP Data from Connected Workspaces ({', '.join(connected_app_names)}):"]
     executed_tools = []
 
     for conn in target_connections:
         c_id = conn.get("connectorId", "").lower()
         token = conn.get("accessToken", "")
         meta = conn.get("metadata", {}) or {}
-        mcp_url = meta.get("mcpUrl") or f"https://mcp.{c_id}.com/mcp"
+        
+        default_mcp_urls = {
+            "linear": "https://mcp.linear.app/mcp",
+            "jira": "https://mcp.atlassian.com/v2/mcp",
+            "notion": "https://mcp.notion.com/mcp",
+            "slack": "https://mcp.slack.com/mcp",
+            "calendly": "https://mcp.calendly.com",
+        }
+        mcp_url = meta.get("mcpUrl") or default_mcp_urls.get(c_id, f"https://mcp.{c_id}.com/mcp")
         workspace_name = meta.get("workspaceName", f"{c_id.capitalize()} Workspace")
         tools_list = meta.get("tools", [])
 
-        lines.append(f"- **{c_id.capitalize()} Integration** ({workspace_name}):")
+        if c_id == "jira":
+            target_tool = "searchJiraIssuesUsingJql"
+            executed_tools.append(target_tool)
+            print(f"[MCP AGENT] 🛠️ Calling '{target_tool}' on Jira ({workspace_name})...")
 
-        # Query tool availability or run probe
-        if tools_list:
-            lines.append(f"  • Connected with {len(tools_list)} available MCP tools.")
-            # Select top relevant tools for user query
-            relevant_tools = [t for t in tools_list if any(kw in t.lower() for kw in user_query.lower().split())]
-            if relevant_tools:
-                lines.append(f"  • Matched query tools: {', '.join(relevant_tools[:4])}")
-        else:
-            lines.append(f"  • Verified active connection to {c_id.capitalize()} remote MCP endpoint.")
+            res = await execute_mcp_jira_workflow(
+                mcp_url=mcp_url,
+                access_token=token,
+                user_query=user_query,
+            )
 
-        # If user asks for specific info (e.g., Slack channels, Calendly event types, Linear issues)
-        if c_id == "slack" and any(k in user_query.lower() for k in ["slack", "message", "channel", "chat"]):
-            executed_tools.append("slack_list_channels")
-            lines.append("  • **Slack Live Context**: Channel & DM listener active; message tools ready.")
-        elif c_id == "calendly" and any(k in user_query.lower() for k in ["calendly", "schedule", "meeting", "availability"]):
-            executed_tools.append("calendly_get_availability")
-            lines.append("  • **Calendly Live Context**: Scheduling engine ready; booking link generator active.")
-        elif c_id == "linear" and any(k in user_query.lower() for k in ["linear", "ticket", "issue"]):
-            executed_tools.append("linear_list_issues")
-            lines.append("  • **Linear Live Context**: Workspace issue sync active.")
-        elif c_id == "notion" and any(k in user_query.lower() for k in ["notion", "doc", "page", "prd"]):
-            executed_tools.append("notion_search")
-            lines.append("  • **Notion Live Context**: Document & PRD workspace synced.")
-        elif c_id == "jira" and any(k in user_query.lower() for k in ["jira", "ticket", "issue", "epic", "story", "board"]):
-            executed_tools.append("jira_list_issues")
-            lines.append("  • **Jira Live Context**: Atlassian project issues, epics & backlog synced.")
+            lines.append(f"- **Jira Integration** ({workspace_name}):")
+            if res.get("isError"):
+                print(f"[MCP AGENT] ⚠️ Jira MCP Error: {res.get('error')}")
+                lines.append(f"  • ⚠️ Could not fetch from Jira MCP: {res.get('error')}.")
+                lines.append(f"  • *Zero items retrieved. Do not invent any issues.*")
+            else:
+                content_str = res.get("content", "").strip()
+                count = res.get("count", 0)
+                print(f"[MCP AGENT] ✅ Jira returned {count} issues.")
+                lines.append(f"  • **Live Jira Tasks & Issues** ({count} retrieved):\n```text\n{content_str}\n```")
+            continue
+
+        # Map target tool for other connectors
+        target_tool = None
+        args: Dict[str, Any] = {}
+
+        if c_id == "linear":
+            target_tool = "list_issues" if "list_issues" in tools_list else "linear_list_issues"
+            if not tools_list:
+                target_tool = "list_issues"
+            args = {"limit": 20}
+        elif c_id == "notion":
+            target_tool = "search" if "search" in tools_list else "notion_search"
+            if not tools_list:
+                target_tool = "search"
+            args = {"query": user_query}
+        elif c_id == "slack":
+            target_tool = "list_channels" if "list_channels" in tools_list else "slack_list_channels"
+        elif c_id == "calendly":
+            target_tool = "get_availability" if "get_availability" in tools_list else "calendly_get_availability"
+
+        if target_tool:
+            executed_tools.append(target_tool)
+            print(f"[MCP AGENT] 🛠️ Calling '{target_tool}' on {c_id.capitalize()} ({workspace_name})...")
+
+            res = await execute_mcp_tool_call_session(
+                mcp_url=mcp_url,
+                access_token=token,
+                tool_name=target_tool,
+                arguments=args,
+            )
+
+            lines.append(f"- **{c_id.capitalize()} Integration** ({workspace_name}):")
+
+            if "error" in res:
+                err_msg = res["error"]
+                if "401" in err_msg or "invalid_token" in err_msg:
+                    err_msg = "OAuth token expired or unauthorized. Please disconnect and reconnect in Integrations tab."
+                print(f"[MCP AGENT] ⚠️ {c_id.capitalize()} MCP Response: {err_msg}")
+                lines.append(f"  • ⚠️ {err_msg}")
+                lines.append(f"  • *Zero items retrieved. Do not invent any issues.*")
+            elif "content" in res and res["content"]:
+                content_str = res["content"].strip()
+                print(f"[MCP AGENT] ✅ {c_id.capitalize()} returned live data ({len(content_str)} chars).")
+                lines.append(f"  • **Live Data Received**:\n```text\n{content_str}\n```")
+            else:
+                print(f"[MCP AGENT] ℹ️ {c_id.capitalize()} returned empty result.")
+                lines.append(f"  • *Zero active items found in {workspace_name}.*")
 
     summary_text = "\n".join(lines)
     return {
