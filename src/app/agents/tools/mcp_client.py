@@ -199,6 +199,9 @@ async def execute_mcp_agent_workflow(
         elif c_id == "notion" and any(k in user_query.lower() for k in ["notion", "doc", "page", "prd"]):
             executed_tools.append("notion_search")
             lines.append("  • **Notion Live Context**: Document & PRD workspace synced.")
+        elif c_id == "jira" and any(k in user_query.lower() for k in ["jira", "ticket", "issue", "epic", "story", "board"]):
+            executed_tools.append("jira_list_issues")
+            lines.append("  • **Jira Live Context**: Atlassian project issues, epics & backlog synced.")
 
     summary_text = "\n".join(lines)
     return {
