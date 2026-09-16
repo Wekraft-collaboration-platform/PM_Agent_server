@@ -494,7 +494,11 @@ async def db_write_worker_node(state: SupervisorState, config: RunnableConfig) -
                 lines.append(f"- **Scheduler Status**: {'Active scheduler configured' if exists else 'No active report scheduler configured'}")
 
         # Check if user query involves task creation, issue creation, or calendar event scheduling
-        write_keywords = ["create", "add", "new task", "new issue", "schedule", "meeting", "calendar", "event", "make task", "generate task", "task-", "bulk", "issue-"]
+        write_keywords = [
+            "create", "add", "new task", "new issue", "schedule", "meeting", "calendar",
+            "event", "make task", "generate task", "task-", "bulk", "issue-", "confirm",
+            "those", "these", "assign", "yes", "insert",
+        ]
         lower_query = user_query.lower()
 
         if any(k in lower_query for k in write_keywords):
@@ -508,13 +512,23 @@ async def db_write_worker_node(state: SupervisorState, config: RunnableConfig) -
                     temperature=0.0,
                 ).with_structured_output(DBWriteIntentExtraction)
 
+                # Collect recent conversation context (last 4 messages) to resolve anaphoras ('these tasks', 'those')
+                context_lines = []
+                recent_msgs = messages[-4:] if len(messages) > 4 else messages
+                for m in recent_msgs:
+                    role = "User" if (isinstance(m, HumanMessage) or (isinstance(m, dict) and m.get("type") in ["user", "human"])) else "Assistant"
+                    content = m.content if hasattr(m, "content") else (m.get("content") if isinstance(m, dict) else str(m))
+                    context_lines.append(f"{role}: {content}")
+                convo_context = "\n".join(context_lines)
+
                 extraction_prompt = [
                     SystemMessage(content=(
                         f"Today's Date: {datetime.now().strftime('%Y-%m-%d')}.\n"
-                        "Extract structured write intentions (task creation, issue creation, calendar events) from the user query.\n"
-                        "Clean up task/issue names (e.g. 'task named-task-101' -> title: 'task-101', 'task-102' -> title: 'task-102'). Do not add placeholder description text."
+                        "Extract structured write intentions (task creation, issue creation, calendar events) from the user query and recent conversation history.\n"
+                        "CRITICAL: If the user says 'create these tasks', 'create those', 'yes confirm', 'assign them to me', or refers to tasks/issues mentioned by the assistant in recent messages, EXTRACT all of those specific tasks/issues from the context into the tasks list!\n"
+                        "Clean up task/issue names (e.g. 'KAN-5 payment failed' -> title: 'payment failed' or 'KAN-5 payment failed', 'task named-task-101' -> title: 'task-101'). Do not add placeholder description text."
                     )),
-                    HumanMessage(content=f"User Query: '{user_query}'"),
+                    HumanMessage(content=f"Recent Conversation History:\n{convo_context}\n\nLatest User Query: '{user_query}'"),
                 ]
                 extracted: DBWriteIntentExtraction = await extractor_llm.ainvoke(extraction_prompt)
 
@@ -988,9 +1002,8 @@ YOUR PERSONA & STANDARDS:
 4. MANDATORY MARKDOWN TABLES FOR ISSUES, TASKS & SPRINTS:
    - When presenting issues (Linear, Jira, internal), tasks, or sprint backlogs/metrics, you MUST format them in a clear, professional Markdown Table (e.g. Columns: `| Key / Title | Status | Priority | Assignee | Labels / Branch | Link |` for Linear/Jira issues; `| Task Title | Status | Priority | Assignee | Due Date |` for Tasks; `| Sprint Name | Status | Velocity / Points | Target Date |` for Sprints).
    - Only use bullet lists for brief high-level summaries or when tabular layout is not applicable.
-5. Structured & Data-Driven: Ground your analysis strictly in the sub-agent findings below.
-6. Capabilities: You help the team manage projects to meet deadlines, track progress, balance workloads, manage Sprints, create calendar events, prioritize backlogs, configure automated schedulers, and seamlessly coordinate connected third-party tools (Jira, Linear, Slack, Notion, Calendly).
 7. STRICT ZERO-HALLUCINATION & GROUND-TRUTH RULE: Under NO circumstances should you fabricate, simulate, or invent tasks, issues, ticket keys, epics, bug titles, or member assignments that are not present in the SUB-AGENT WORKER DATA. If an integration (e.g. Linear, Jira) returns 0 items or returns an error/unauthorized status, explicitly inform the user of that exact status and advise them to reconnect in the Integrations tab. Never invent placeholder tickets.
+8. NEVER CLAIM WRITE ACTIONS WITHOUT CONFIRMATION: Never claim or state that tasks, issues, or calendar events 'have been created' or 'have been inserted' unless the SUB-AGENT WORKER DATA explicitly shows a successful write result (e.g. '✅ Bulk created ...'). If no database insertion occurred, do not claim tasks were created.
 
 SUB-AGENT WORKER DATA:
 {findings_prompt}
