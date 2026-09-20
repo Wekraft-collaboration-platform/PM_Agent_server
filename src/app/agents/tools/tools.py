@@ -54,30 +54,6 @@ def convex_post_sync(endpoint: str, payload: dict) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MEMORY TOOLS (@tool)
-# ─────────────────────────────────────────────────────────────────────────────
-
-@tool
-def search_user_memory(user_id: str, query: str) -> dict:
-    """Search long-term memory for user preferences, past choices, and user context.
-    Use this whenever the user asks about their personal preferences, past interactions, or stored facts.
-    """
-    print(f"[search_user_memory] Searching Mem0 for user_id={user_id}, query='{query}'")
-    try:
-        mem0_key = os.getenv("MEM0_API_KEY")
-        if not mem0_key:
-            return {"memories": [], "note": "MEM0_API_KEY not set"}
-        from mem0 import MemoryClient
-        client = MemoryClient(api_key=mem0_key)
-        results = client.search(query, user_id=user_id)
-        print(f"[search_user_memory] ✓ Found {len(results)} memory entries")
-        return {"memories": results}
-    except Exception as e:
-        print(f"[search_user_memory] ✗ Error searching Mem0: {e}")
-        return {"memories": [], "error": str(e)}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # READ & ANALYTICS TOOLS (@tool)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -364,7 +340,6 @@ async def write_bulk_issues_to_convex(payload: dict) -> str:
 
 # All Mutation / Write / HITL Tools
 DBWRITE_TOOLS = [
-    search_user_memory,
     create_calendar_event,
     setup_report_scheduler,
     bulk_create_tasks,

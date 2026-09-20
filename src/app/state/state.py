@@ -64,7 +64,7 @@ class SupervisorState(TypedDict):
     _mcp_messages: Annotated[List[Any], reset_or_add]
     _mcp_tool_call_id: Optional[str]
 
-    # 5. Shared Memory & Context Bus (Mem0, Semantic Cache, Tool Outputs, Document Attachments)
+    # 5. Shared Context Bus (Semantic Cache, Tool Outputs, Document Attachments)
     retrieved_memory: Optional[List[str]]
     standup_data: Optional[Dict[str, Any]]
     sprint_insights: Optional[Dict[str, Any]]

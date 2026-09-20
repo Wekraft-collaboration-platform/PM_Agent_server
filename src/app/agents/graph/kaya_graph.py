@@ -8,7 +8,7 @@ Architecture:
    - ['analyst', 'db_write', 'sprint'] -> Parallel Sub-Agent Worker execution
 3. 3 Specialized Sub-Agents:
    - Analyst Sub-Agent (Parallel read tools: standups, tasks, issues, workloads, project timeline)
-   - DB Write Sub-Agent (Mem0 memory search, calendar events, report scheduler, PRD bulk tools)
+   - DB Write Sub-Agent (Task creation, issue creation, calendar events, report scheduler)
    - Sprint Sub-Agent (Sprint analytics/velocity, sprint creation, task allocation)
 4. Fan-In Aggregation & Unified Synthesis:
    - Kaya Synthesizer (gpt-4.1-mini): Ingests all worker findings + project deadline awareness,
@@ -48,7 +48,6 @@ from app.agents.tools.tools import (
     fetch_sprint_insights_async,
     fetch_project_insights_async,
     fetch_scheduler_async,
-    search_user_memory,
     write_calendar_event_to_convex,
     write_sprint_to_convex,
     write_items_to_sprint,
@@ -70,10 +69,10 @@ class SupervisorDecision(BaseModel):
     actions: List[str] = Field(
         description=(
             "List of sub-agent actions to trigger in parallel (select ONLY the sub-agents explicitly required):\n"
-            "- 'mcp': ONLY for third-party external integrations (explicitly requested Jira, Linear, Slack, Calendly, Notion, MCP). NEVER call for internal project tasks/issues/sprints or If user dosent asked for third party.\n"
-            "- 'db_write': user memory search (Mem0), calendar events, report scheduler setup, or bulk task creation\n"
-            "- 'analyst': internal project database analytics: user daily standup, task summaries, issue tracking, member workloads, project health, deadlines\n"
-            "- 'sprint': sprint insights/velocity, active sprint status, sprint creation, or backlog item assignments\n"
+            "- 'mcp': ONLY for third-party external integrations (explicitly requested Jira, Linear, Slack, Calendly, Notion, MCP). NEVER call for internal project tasks/issues/sprints or if user hasn't asked for third party.\n"
+            "- 'db_write': DB Write agent for creating tasks, issues, calendar events, or report schedulers in this project\n"
+            "- 'analyst': Project Analyst agent for internal project read analytics: user daily standup, task summaries, issue tracking, member workloads, project health, deadlines\n"
+            "- 'sprint': Sprint agent for sprint insights/velocity, active sprint status, sprint creation, or backlog item assignments\n"
             "- 'direct_response': simple greeting, casual conversation, or general product manager chat"
         )
     )
@@ -84,26 +83,31 @@ ROUTER_SYSTEM_PROMPT = """You are the primary Supervisor Router for the WEKRAFT 
 Analyze the user's incoming query (and previous query context if provided) and decide strictly which specialized sub-agent workers to trigger.
 
 CRITICAL RULES:
-1. THIRD-PARTY / MCP AGENT ('mcp'):
+1. CREATING TASKS, ISSUES, SPRINTS IN THIS PROJECT:
+   - When the user asks to create, add, or generate tasks, issues, or calendar events (e.g., 'create 3 issues for these errors', 'create tasks', 'schedule meeting'), it ALWAYS targets this project's internal database -> route to 'db_write' (DB Write Agent).
+   - When the user asks to create or plan sprints -> route to 'sprint' (Sprint Agent).
+   - NEVER call 'mcp' for creating tasks, issues, or sprints unless the user explicitly specifies an external third-party destination (e.g., 'create issue in Jira', 'create ticket in Linear'). Even if issues are based on previous Sentry errors, creating them is an internal project action.
+
+2. THIRD-PARTY / MCP AGENT ('mcp'):
    - ONLY call 'mcp' if the user EXPLICITLY asks for a third-party app or external tool (Jira, Linear, Slack, Calendly, Notion, external service, MCP), OR if the current query is a follow-up referring back to a third-party app mentioned in the previous query (e.g., Previous: 'get me all tasks from Jira', Current: 'i want issues also from that' -> 'mcp').
    - NEVER call 'mcp' for general project tasks, issues, sprints, or standups if no third-party integration was mentioned in either the current or previous query.
 
-2. SPRINT AGENT ('sprint'):
+3. SPRINT AGENT ('sprint'):
    - ALWAYS call 'sprint' whenever the user asks about sprints (sprint progress, active sprint, sprint velocity, sprint tasks, sprint items, sprint creation, sprint planning), or follows up on previous sprint context.
 
-3. MINIMAL SUB-AGENT CALLS:
+4. MINIMAL SUB-AGENT CALLS:
    - NEVER call extra sub-agents if not asked by the user. Route ONLY to the exact sub-agents necessary to fulfill the user's request.
-   - Example 1: 'what are my tasks/issues and sprints' -> ['analyst', 'sprint'] (NO 'mcp').
-   - Example 2: 'show my tasks and standup' -> ['analyst'] (NO 'sprint', NO 'mcp').
-   - Example 3: 'how is the current sprint doing' -> ['sprint'] (NO 'analyst', NO 'mcp').
-   - Example 4: 'check jira tickets and slack' -> ['mcp'].
-   - Example 5: Previous Query: 'get things from jira/notion/etc' | Current Query: 'get issues from that too' -> ['mcp'].
+   - Example 1: 'create issues for these sentry errors' -> ['db_write'] (NO 'mcp').
+   - Example 2: 'what are my tasks/issues and sprints' -> ['analyst', 'sprint'] (NO 'mcp').
+   - Example 3: 'show my tasks and standup' -> ['analyst'] (NO 'sprint', NO 'mcp').
+   - Example 4: 'how is the current sprint doing' -> ['sprint'] (NO 'analyst', NO 'mcp').
+   - Example 5: 'check jira tickets and slack' -> ['mcp'].
    - Example 6: 'hi how are you' -> ['direct_response'].
 
 Available Actions:
 1. 'mcp': Third-party SaaS integrations ONLY (Jira, Linear, Slack, Calendly, Notion, Sentry, HubSpot, Vercel).
-2. 'db_write': State mutations or personal memory: Long-term memory search (Mem0), calendar event scheduling, report scheduler setup, or bulk PRD task/issue generation.
-3. 'analyst': Internal read-only analytics: User daily standup, task summaries, issue tracking, member workloads, project health, or project deadlines/timelines.
+2. 'db_write': DB Write agent for project mutations: internal task creation, issue creation, calendar event scheduling, report scheduler setup.
+3. 'analyst': Project Analyst agent for internal read-only analytics: User daily standup, task summaries, issue tracking, member workloads, project health, or project deadlines/timelines.
 4. 'sprint': Sprint velocity, active sprint progress, sprint creation, or backlog item allocation.
 5. 'direct_response': Greetings (hi, hello), casual conversation, or general questions requiring no live database queries.
 """
@@ -134,31 +138,54 @@ async def route_user_request(user_input: str, project_id: Optional[str] = None) 
         if not decision.actions:
             decision.actions = ["direct_response"]
 
+        latest_text = user_input
+        if "Current Query:" in user_input:
+            latest_text = user_input.split("Current Query:")[-1].strip()
+        lower_latest = latest_text.lower()
         lower_query = user_input.lower()
 
-        # Rule 1 Deterministic Safeguard: Never call MCP unless explicitly requested
-        mcp_explicit_keywords = ["jira", "linear", "slack", "calendly", "notion", "sentry", "hubspot", "vercel", "mcp", "atlassian"]
-        has_explicit_mcp = any(k in lower_query for k in mcp_explicit_keywords)
-        if not has_explicit_mcp and "mcp" in decision.actions:
-            decision.actions.remove("mcp")
-            if not decision.actions:
-                decision.actions = ["analyst"]
-        elif has_explicit_mcp and "mcp" not in decision.actions:
+        # Check for internal creation intent vs external third-party destination
+        creation_verbs = ["create", "add", "make", "insert", "generate", "schedule", "new"]
+        creation_nouns = ["task", "tasks", "issue", "issues", "bug", "bugs", "sprint", "sprints", "event", "meeting", "these", "those"]
+        is_internal_creation = any(v in lower_latest for v in creation_verbs) and any(n in lower_latest for n in creation_nouns)
+        mcp_explicit_targets = ["jira", "linear", "slack", "calendly", "notion", "hubspot", "vercel", "mcp", "atlassian"]
+        has_explicit_mcp_in_latest = any(k in lower_latest for k in mcp_explicit_targets)
+
+        # Rule 1: Internal creation routing (Task / Issue -> db_write, Sprint -> sprint)
+        if is_internal_creation and not has_explicit_mcp_in_latest:
+            if any(n in lower_latest for n in ["task", "tasks", "issue", "issues", "bug", "bugs", "event", "meeting", "these", "those"]):
+                if "db_write" not in decision.actions:
+                    decision.actions.append("db_write")
+            if any(n in lower_latest for n in ["sprint", "sprints"]):
+                if "sprint" not in decision.actions:
+                    decision.actions.append("sprint")
+            if "mcp" in decision.actions:
+                decision.actions.remove("mcp")
+            if "direct_response" in decision.actions:
+                decision.actions.remove("direct_response")
+
+        # Rule 2 Deterministic Safeguard: Never call MCP unless explicitly requested
+        elif not has_explicit_mcp_in_latest:
+            if "mcp" in decision.actions:
+                decision.actions.remove("mcp")
+                if not decision.actions:
+                    decision.actions = ["analyst"]
+        elif has_explicit_mcp_in_latest and "mcp" not in decision.actions:
             if "direct_response" in decision.actions:
                 decision.actions.remove("direct_response")
             decision.actions.append("mcp")
             decision.reasoning += " (MCP auto-included due to explicit keyword match)"
 
-        # Rule 2 Deterministic Safeguard: Always call sprint agent for sprint queries
+        # Rule 3 Deterministic Safeguard: Always call sprint agent for sprint queries
         sprint_keywords = ["sprint", "sprints", "velocity", "backlog", "burndown"]
-        if any(k in lower_query for k in sprint_keywords):
+        if any(k in lower_latest for k in sprint_keywords):
             if "sprint" not in decision.actions:
                 if "direct_response" in decision.actions:
                     decision.actions.remove("direct_response")
                 decision.actions.append("sprint")
                 decision.reasoning += " (Sprint agent auto-included due to sprint keyword match)"
 
-        # Rule 3: Clean up direct_response if actionable subagents exist
+        # Rule 4: Clean up direct_response if actionable subagents exist
         if len(decision.actions) > 1 and "direct_response" in decision.actions:
             decision.actions.remove("direct_response")
 
@@ -170,12 +197,18 @@ async def route_user_request(user_input: str, project_id: Optional[str] = None) 
         safe_err = str(e).encode("ascii", "replace").decode("ascii")
         print(f"[ROUTER WARNING] Fallback routing due to: {safe_err}")
         actions = []
-        lower_query = user_input.lower()
-        if any(k in lower_query for k in ["sprint", "sprints", "velocity"]):
+        latest_text = user_input
+        if "Current Query:" in user_input:
+            latest_text = user_input.split("Current Query:")[-1].strip()
+        lower_latest = latest_text.lower()
+
+        if any(k in lower_latest for k in ["sprint", "sprints", "velocity"]):
             actions.append("sprint")
-        if any(k in lower_query for k in ["task", "tasks", "issue", "issues", "standup", "workload", "health", "project"]):
+        if any(k in lower_latest for k in ["create", "add", "make", "insert", "schedule"]) and any(k in lower_latest for k in ["task", "tasks", "issue", "issues", "event", "these", "those"]):
+            actions.append("db_write")
+        elif any(k in lower_latest for k in ["task", "tasks", "issue", "issues", "standup", "workload", "health", "project"]):
             actions.append("analyst")
-        if any(k in lower_query for k in ["jira", "linear", "slack", "calendly", "notion", "sentry", "hubspot", "vercel", "mcp"]):
+        if any(k in lower_latest for k in ["jira", "linear", "slack", "calendly", "notion", "hubspot", "vercel", "mcp"]):
             actions.append("mcp")
         if not actions:
             actions = ["direct_response"]
@@ -278,10 +311,10 @@ async def supervisor_router_node(state: SupervisorState, config: RunnableConfig)
     for action in decision.actions:
         if action == "analyst":
             _emit_stream_status(subagent_called="analyst_agent")
-        elif action == "sprint":
-            _emit_stream_status(subagent_called="sprint_agent")
         elif action == "db_write":
             _emit_stream_status(subagent_called="db_write_agent")
+        elif action == "sprint":
+            _emit_stream_status(subagent_called="sprint_agent")
         elif action == "mcp":
             _emit_stream_status(subagent_called="mcp_agent")
 
@@ -496,27 +529,18 @@ class DBWriteIntentExtraction(BaseModel):
 async def db_write_worker_node(state: SupervisorState, config: RunnableConfig) -> Dict[str, Any]:
     """
     DB Write Sub-Agent:
-    - Handles Mem0 long-term memory searches.
     - Handles state mutations and HITL write flows (task creation, issue creation, calendar events, report schedulers).
     - Triggers langgraph.types.interrupt(...) for user confirmation before executing state writes.
     - Wrapped in try/except for graceful error reporting.
     """
-    _emit_stream_status(status_text="DB Write worker searching memory & preparing actions...")
+    _emit_stream_status(status_text="DB Write worker preparing internal actions...")
     project_id = state.get("project_id") or ""
     user_id = state.get("user_id") or ""
     messages = state.get("messages", [])
     user_query = _get_latest_user_text(messages)
-    lines = ["### DB Write / Mutation Sub-Agent Findings:"]
+    lines = ["### DB Write Sub-Agent Findings:"]
 
     try:
-        memories = []
-        # Search Mem0 for user memory/preferences
-        if any(k in user_query.lower() for k in ["remember", "preference", "last time", "memory", "favorite", "my info"]):
-            _emit_stream_status(tool_called="search_user_memory", caller="DB Write agent")
-            mem_result = search_user_memory.invoke({"user_id": user_id, "query": user_query})
-            memories = mem_result.get("memories", [])
-            if memories:
-                lines.append(f"- **Retrieved Memory**: Found {len(memories)} relevant past user context entries.")
 
         # Check for report scheduler queries
         if "scheduler" in user_query.lower() or "report" in user_query.lower():
@@ -737,7 +761,6 @@ async def db_write_worker_node(state: SupervisorState, config: RunnableConfig) -
 
         return {
             "_db_write_messages": [RESET_SENTINEL, {"role": "db_write", "content": summary_text}],
-            "retrieved_memory": [m.get("memory", "") for m in memories if isinstance(m, dict)],
         }
 
     except GraphInterrupt:
@@ -748,7 +771,7 @@ async def db_write_worker_node(state: SupervisorState, config: RunnableConfig) -
         return {
             "_db_write_messages": [
                 RESET_SENTINEL,
-                {"role": "db_write", "content": f"⚠️ [Write/Memory Notice]: {error_msg}"},
+                {"role": "db_write", "content": f"⚠️ [DB Write Notice]: {error_msg}"},
             ],
             "active_error": error_msg,
         }
@@ -1005,7 +1028,7 @@ async def kaya_synthesizer_node(state: SupervisorState, config: RunnableConfig) 
     findings_blocks = []
     for key, label in [
         ("_analyst_messages", "ANALYST FINDINGS"),
-        ("_db_write_messages", "MEMORY & WRITE ACTIONS"),
+        ("_db_write_messages", "DB WRITE ACTIONS"),
         ("_sprint_messages", "SPRINT FINDINGS"),
         ("_mcp_messages", "THIRD-PARTY MCP INTEGRATION FINDINGS (Sentry, Jira, Vercel, Slack, Linear, Notion, ETC)"),
     ]:
