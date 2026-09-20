@@ -39,6 +39,15 @@ CONNECTOR_KEYWORDS: Dict[str, List[str]] = {
     "jira": [
         "jira", "epic", "story", "board", "jira ticket", "jira issue", "atlassian"
     ],
+    "sentry": [
+        "sentry", "error", "exception", "crash", "stacktrace", "issue", "bug", "alert", "incident"
+    ],
+    "hubspot": [
+        "hubspot", "crm", "contact", "deal", "lead", "company", "marketing", "pipeline", "sales"
+    ],
+    "vercel": [
+        "vercel", "deployment", "deploy", "domain", "project", "env", "environment", "build", "alias", "preview"
+    ],
 }
 
 
@@ -437,6 +446,9 @@ async def execute_mcp_agent_workflow(
         "notion": "https://mcp.notion.com/mcp",
         "slack": "https://mcp.slack.com/mcp",
         "calendly": "https://mcp.calendly.com",
+        "sentry": "https://mcp.sentry.dev/mcp",
+        "hubspot": "https://mcp.hubspot.com",
+        "vercel": "https://mcp.vercel.com",
     }
 
     # Discover live tools across strictly scoped connectors

@@ -81,15 +81,15 @@ class SupervisorDecision(BaseModel):
 
 
 ROUTER_SYSTEM_PROMPT = """You are the primary Supervisor Router for the WEKRAFT AI Platform.
-Analyze the user's incoming query and decide strictly which specialized sub-agent workers to trigger.
+Analyze the user's incoming query (and previous query context if provided) and decide strictly which specialized sub-agent workers to trigger.
 
 CRITICAL RULES:
 1. THIRD-PARTY / MCP AGENT ('mcp'):
-   - ONLY call 'mcp' if the user EXPLICITLY asks for a third-party app or external tool (Jira, Linear, Slack, Calendly, Notion, external service, MCP).
-   - NEVER call 'mcp' for general project tasks, issues, sprints, or standups if no third-party integration was explicitly mentioned.
+   - ONLY call 'mcp' if the user EXPLICITLY asks for a third-party app or external tool (Jira, Linear, Slack, Calendly, Notion, external service, MCP), OR if the current query is a follow-up referring back to a third-party app mentioned in the previous query (e.g., Previous: 'get me all tasks from Jira', Current: 'i want issues also from that' -> 'mcp').
+   - NEVER call 'mcp' for general project tasks, issues, sprints, or standups if no third-party integration was mentioned in either the current or previous query.
 
 2. SPRINT AGENT ('sprint'):
-   - ALWAYS call 'sprint' whenever the user asks about sprints (sprint progress, active sprint, sprint velocity, sprint tasks, sprint items, sprint creation, sprint planning).
+   - ALWAYS call 'sprint' whenever the user asks about sprints (sprint progress, active sprint, sprint velocity, sprint tasks, sprint items, sprint creation, sprint planning), or follows up on previous sprint context.
 
 3. MINIMAL SUB-AGENT CALLS:
    - NEVER call extra sub-agents if not asked by the user. Route ONLY to the exact sub-agents necessary to fulfill the user's request.
@@ -97,10 +97,11 @@ CRITICAL RULES:
    - Example 2: 'show my tasks and standup' -> ['analyst'] (NO 'sprint', NO 'mcp').
    - Example 3: 'how is the current sprint doing' -> ['sprint'] (NO 'analyst', NO 'mcp').
    - Example 4: 'check jira tickets and slack' -> ['mcp'].
-   - Example 5: 'hi how are you' -> ['direct_response'].
+   - Example 5: Previous Query: 'get things from jira/notion/etc' | Current Query: 'get issues from that too' -> ['mcp'].
+   - Example 6: 'hi how are you' -> ['direct_response'].
 
 Available Actions:
-1. 'mcp': Third-party SaaS integrations ONLY (Jira, Linear, Slack, Calendly, Notion).
+1. 'mcp': Third-party SaaS integrations ONLY (Jira, Linear, Slack, Calendly, Notion, Sentry, HubSpot, Vercel).
 2. 'db_write': State mutations or personal memory: Long-term memory search (Mem0), calendar event scheduling, report scheduler setup, or bulk PRD task/issue generation.
 3. 'analyst': Internal read-only analytics: User daily standup, task summaries, issue tracking, member workloads, project health, or project deadlines/timelines.
 4. 'sprint': Sprint velocity, active sprint progress, sprint creation, or backlog item allocation.
@@ -116,7 +117,7 @@ async def route_user_request(user_input: str, project_id: Optional[str] = None) 
 
     messages = [
         SystemMessage(content=ROUTER_SYSTEM_PROMPT),
-        HumanMessage(content=f"User Query: '{user_input}' | Active Project ID: {project_id or 'none'}"),
+        HumanMessage(content=f"User Query Context:\n{user_input}\n| Active Project ID: {project_id or 'none'}"),
     ]
 
     try:
@@ -136,7 +137,7 @@ async def route_user_request(user_input: str, project_id: Optional[str] = None) 
         lower_query = user_input.lower()
 
         # Rule 1 Deterministic Safeguard: Never call MCP unless explicitly requested
-        mcp_explicit_keywords = ["jira", "linear", "slack", "calendly", "notion", "mcp", "atlassian"]
+        mcp_explicit_keywords = ["jira", "linear", "slack", "calendly", "notion", "sentry", "hubspot", "vercel", "mcp", "atlassian"]
         has_explicit_mcp = any(k in lower_query for k in mcp_explicit_keywords)
         if not has_explicit_mcp and "mcp" in decision.actions:
             decision.actions.remove("mcp")
@@ -174,7 +175,7 @@ async def route_user_request(user_input: str, project_id: Optional[str] = None) 
             actions.append("sprint")
         if any(k in lower_query for k in ["task", "tasks", "issue", "issues", "standup", "workload", "health", "project"]):
             actions.append("analyst")
-        if any(k in lower_query for k in ["jira", "linear", "slack", "calendly", "notion", "mcp"]):
+        if any(k in lower_query for k in ["jira", "linear", "slack", "calendly", "notion", "sentry", "hubspot", "vercel", "mcp"]):
             actions.append("mcp")
         if not actions:
             actions = ["direct_response"]
@@ -192,9 +193,41 @@ async def route_user_request(user_input: str, project_id: Optional[str] = None) 
 def _get_latest_user_text(messages: List[BaseMessage]) -> str:
     """Extracts text content of the latest human message."""
     for m in reversed(messages):
-        if m.type == "human":
+        if getattr(m, "type", None) == "human":
             return m.content if isinstance(m.content, str) else str(m.content)
+        elif isinstance(m, dict):
+            role = m.get("role") or m.get("type")
+            if role in ["human", "user"]:
+                return m.get("content", "")
     return ""
+
+
+def _get_router_user_query(messages: List[BaseMessage]) -> str:
+    """
+    Extracts current query (current) + previous user query (current - 1)
+    to provide the Supervisor Router with conversational context for follow-up questions.
+    """
+    human_texts: List[str] = []
+    for m in messages:
+        if getattr(m, "type", None) == "human":
+            text = m.content if isinstance(m.content, str) else str(m.content)
+            if text and text.strip():
+                human_texts.append(text.strip())
+        elif isinstance(m, dict):
+            role = m.get("role") or m.get("type")
+            if role in ["human", "user"]:
+                text = m.get("content", "")
+                if isinstance(text, str) and text.strip():
+                    human_texts.append(text.strip())
+
+    if not human_texts:
+        return ""
+    if len(human_texts) == 1:
+        return f"Current Query: {human_texts[-1]}"
+
+    current_query = human_texts[-1]
+    prev_query = human_texts[-2]
+    return f"Previous Query: {prev_query}\nCurrent Query: {current_query}"
 
 
 def _emit_stream_status(
@@ -232,7 +265,7 @@ def _emit_stream_status(
 async def supervisor_router_node(state: SupervisorState, config: RunnableConfig) -> Dict[str, Any]:
     """Node: Evaluates user query and determines parallel execution branches."""
     messages = state.get("messages", [])
-    user_query = _get_latest_user_text(messages)
+    user_query = _get_router_user_query(messages)
     project_id = state.get("project_id")
 
     _emit_stream_status(status_text="Kaya is thinking...")
@@ -625,15 +658,16 @@ async def db_write_worker_node(state: SupervisorState, config: RunnableConfig) -
                     else:
                         edits = resume_response.get("edits") if isinstance(resume_response, dict) else None
                         final_issues = edits if isinstance(edits, list) and edits else issue_items_preview
-                        issues_for_convex = [
-                            {
+                        issues_for_convex = []
+                        for i in final_issues:
+                            raw_p = (i.get("priority") or i.get("severity") or "medium").lower()
+                            sev = "critical" if raw_p in ["critical", "high"] else "low" if raw_p == "low" else "medium"
+                            issues_for_convex.append({
                                 "title": i.get("title", "Issue").replace("named-", "").strip(),
                                 "description": i.get("description", "") or "",
-                                "priority": i.get("priority", "medium"),
-                                "severity": "medium",
-                            }
-                            for i in final_issues
-                        ]
+                                "severity": sev,
+                                "environment": "dev",
+                            })
                         write_res = await write_bulk_issues_to_convex({"projectId": project_id, "issues": issues_for_convex})
                         print(f"[HITL WRITE RESULT] Convex bulkInsertIssues response: {write_res}")
                         lines.append(f"- **Issue Creation Status**: {write_res} ({len(issues_for_convex)} issue(s) created in project)")
@@ -808,7 +842,7 @@ async def mcp_worker_node(state: SupervisorState, config: RunnableConfig) -> Dic
     - Normalized into structured Markdown findings in _mcp_messages.
     - Zero cascading failures via try/except isolation.
     """
-    _emit_stream_status(status_text="MCP Agent querying connected apps (Slack, Calendly, Linear, Notion)...")
+    _emit_stream_status(status_text="MCP Agent querying connected workspace apps...")
     project_id = state.get("project_id") or ""
     user_name = state.get("user_name") or ""
     messages = state.get("messages", [])
