@@ -56,6 +56,7 @@ from app.agents.tools.tools import (
     write_bulk_issues_to_convex,
 )
 from app.agents.tools.mcp_client import execute_mcp_agent_workflow
+from app.core.utils.document_parser import get_parsed_document_from_cache
 
 load_dotenv(override=True)
 
@@ -113,15 +114,21 @@ Available Actions:
 """
 
 
-async def route_user_request(user_input: str, project_id: Optional[str] = None) -> SupervisorDecision:
+async def route_user_request(
+    user_input: str,
+    project_id: Optional[str] = None,
+    has_attached_doc: bool = False,
+) -> SupervisorDecision:
     """Evaluates user input using Groq 120b LLM router and outputs structured SupervisorDecision with deterministic safeguards."""
     groq_api_key = os.getenv("GROQ_API_KEY", "")
     # Ensure 120b model is used for the router (openai/gpt-oss-120b)
     router_model = os.getenv("GROQ_ROUTER_MODEL", "openai/gpt-oss-120b")
 
+    doc_hint = "\n[Notice: An uploaded PRD/specification document is attached in this session.]" if has_attached_doc else ""
+
     messages = [
         SystemMessage(content=ROUTER_SYSTEM_PROMPT),
-        HumanMessage(content=f"User Query Context:\n{user_input}\n| Active Project ID: {project_id or 'none'}"),
+        HumanMessage(content=f"User Query Context:\n{user_input}{doc_hint}\n| Active Project ID: {project_id or 'none'}"),
     ]
 
     try:
@@ -144,8 +151,21 @@ async def route_user_request(user_input: str, project_id: Optional[str] = None) 
         lower_latest = latest_text.lower()
         lower_query = user_input.lower()
 
+        # Document-specific routing rules
+        if has_attached_doc or "[attached:" in lower_query or "prd" in lower_latest or "doc" in lower_latest:
+            if any(k in lower_latest for k in ["create", "add", "make", "insert", "generate", "extract", "task", "tasks", "bulk"]):
+                if "db_write" not in decision.actions:
+                    decision.actions.append("db_write")
+                if "direct_response" in decision.actions:
+                    decision.actions.remove("direct_response")
+            elif any(k in lower_latest for k in ["critical", "issue", "issues", "bug", "bugs", "risk", "risks", "review", "tell me", "what", "analyze", "explain"]):
+                if "analyst" not in decision.actions:
+                    decision.actions.append("analyst")
+                if "direct_response" in decision.actions:
+                    decision.actions.remove("direct_response")
+
         # Check for internal creation intent vs external third-party destination
-        creation_verbs = ["create", "add", "make", "insert", "generate", "schedule", "new"]
+        creation_verbs = ["create", "add", "make", "insert", "generate", "schedule", "new", "extract"]
         creation_nouns = ["task", "tasks", "issue", "issues", "bug", "bugs", "sprint", "sprints", "event", "meeting", "these", "those"]
         is_internal_creation = any(v in lower_latest for v in creation_verbs) and any(n in lower_latest for n in creation_nouns)
         mcp_explicit_targets = ["jira", "linear", "slack", "calendly", "notion", "hubspot", "vercel", "mcp", "atlassian"]
@@ -204,9 +224,9 @@ async def route_user_request(user_input: str, project_id: Optional[str] = None) 
 
         if any(k in lower_latest for k in ["sprint", "sprints", "velocity"]):
             actions.append("sprint")
-        if any(k in lower_latest for k in ["create", "add", "make", "insert", "schedule"]) and any(k in lower_latest for k in ["task", "tasks", "issue", "issues", "event", "these", "those"]):
+        if any(k in lower_latest for k in ["create", "add", "make", "insert", "schedule", "extract"]) and any(k in lower_latest for k in ["task", "tasks", "issue", "issues", "event", "these", "those"]):
             actions.append("db_write")
-        elif any(k in lower_latest for k in ["task", "tasks", "issue", "issues", "standup", "workload", "health", "project"]):
+        elif any(k in lower_latest for k in ["task", "tasks", "issue", "issues", "standup", "workload", "health", "project", "critical", "prd", "doc"]):
             actions.append("analyst")
         if any(k in lower_latest for k in ["jira", "linear", "slack", "calendly", "notion", "hubspot", "vercel", "mcp"]):
             actions.append("mcp")
@@ -300,9 +320,10 @@ async def supervisor_router_node(state: SupervisorState, config: RunnableConfig)
     messages = state.get("messages", [])
     user_query = _get_router_user_query(messages)
     project_id = state.get("project_id")
+    file_id = state.get("file_id")
 
     _emit_stream_status(status_text="Kaya is thinking...")
-    decision = await route_user_request(user_query, project_id)
+    decision = await route_user_request(user_query, project_id, has_attached_doc=bool(file_id))
 
     # Immediately emit reasoning event so frontend displays it right after thinking
     _emit_stream_status(status_text="Kaya is reasoning...", reasoning=decision.reasoning)
@@ -469,6 +490,40 @@ async def analyst_worker_node(state: SupervisorState, config: RunnableConfig) ->
                 m_issues = m.get("totalIssues", len(m.get("issues", [])))
                 lines.append(f"  • Member: {m_name} ({m_role}) -> Tasks Assigned: {m_tasks} | Issues: {m_issues}")
 
+        # Document Analysis Section (if PRD/specification doc is attached or referenced)
+        file_id = state.get("file_id")
+        if file_id and user_id:
+            try:
+                _emit_stream_status(tool_called="parse_document_eval", caller="Project analyst")
+                doc_data = await get_parsed_document_from_cache(user_id=user_id, file_id=file_id)
+                if doc_data and doc_data.get("parsed_markdown"):
+                    filename = doc_data.get("file_name", "Uploaded PRD/Document")
+                    doc_md = doc_data.get("parsed_markdown", "")
+                    
+                    eval_prompt = [
+                        SystemMessage(content=(
+                            "You are a Senior Technical Product Manager & Systems Architect on WEKRAFT.\n"
+                            "Analyze the attached PRD / specification document and produce an executive PM breakdown:\n"
+                            "1. Document Scope & Core Objectives: Short 2-sentence summary.\n"
+                            "2. Top Critical Issues, Blockers & System Bottlenecks: Highlight highest risk technical flaws, unhandled error conditions, or architectural risks (ranked by severity: Critical, High, Medium).\n"
+                            "3. Gaps, Missing Specs & Security/Compliance Concerns: Edge cases or unaddressed requirements.\n"
+                            "4. Recommended Action Items: Concrete next steps for the engineering team.\n"
+                            "Be crisp, highly specific, reference real requirements from the document, and format with clear markdown bullet points and mini tables."
+                        )),
+                        HumanMessage(content=f"Document Filename: {filename}\n\nDocument Content:\n{doc_md[:25000]}\n\nUser Question/Focus: '{user_query}'"),
+                    ]
+                    eval_llm = ChatOpenAI(
+                        model=os.getenv("GROQ_ROUTER_MODEL", "openai/gpt-oss-120b"),
+                        openai_api_key=os.getenv("GROQ_API_KEY", ""),
+                        openai_api_base="https://api.groq.com/openai/v1",
+                        temperature=0.1,
+                    )
+                    eval_res = await eval_llm.ainvoke(eval_prompt)
+                    lines.append(f"\n### PRD / Document Review & Critical Issues ({filename}):\n{eval_res.content}")
+            except Exception as doc_err:
+                print(f"[ANALYST WORKER] Document analysis notice: {doc_err}")
+                lines.append(f"- **Document Analysis Notice**: {doc_err}")
+
         findings_text = "\n".join(lines)
 
         return {
@@ -550,15 +605,29 @@ async def db_write_worker_node(state: SupervisorState, config: RunnableConfig) -
                 exists = scheduler_info.get("exists", False)
                 lines.append(f"- **Scheduler Status**: {'Active scheduler configured' if exists else 'No active report scheduler configured'}")
 
+        # Retrieve attached PRD document from cache if present
+        file_id = state.get("file_id")
+        doc_context = ""
+        if file_id and user_id:
+            try:
+                doc_data = await get_parsed_document_from_cache(user_id=user_id, file_id=file_id)
+                if doc_data and doc_data.get("parsed_markdown"):
+                    filename = doc_data.get("file_name", "Uploaded PRD")
+                    doc_md = doc_data.get("parsed_markdown", "")
+                    doc_context = f"\n\nATTACHED PRD / SPECIFICATION DOCUMENT ({filename}):\n{doc_md[:25000]}\n"
+                    print(f"[DB WRITE WORKER] Ingested attached PRD '{filename}' ({len(doc_md)} chars) for task/issue extraction.")
+            except Exception as doc_err:
+                print(f"[DB WRITE WORKER] Error reading doc cache: {doc_err}")
+
         # Check if user query involves task creation, issue creation, or calendar event scheduling
         write_keywords = [
             "create", "add", "new task", "new issue", "schedule", "meeting", "calendar",
             "event", "make task", "generate task", "task-", "bulk", "issue-", "confirm",
-            "those", "these", "assign", "yes", "insert",
+            "those", "these", "assign", "yes", "insert", "extract", "tasks", "issues",
         ]
         lower_query = user_query.lower()
 
-        if any(k in lower_query for k in write_keywords):
+        if any(k in lower_query for k in write_keywords) or bool(doc_context):
             try:
                 groq_api_key = os.getenv("GROQ_API_KEY", "")
                 extractor_model = os.getenv("GROQ_ROUTER_MODEL", "openai/gpt-oss-120b")
@@ -581,11 +650,21 @@ async def db_write_worker_node(state: SupervisorState, config: RunnableConfig) -
                 extraction_prompt = [
                     SystemMessage(content=(
                         f"Today's Date: {datetime.now().strftime('%Y-%m-%d')}.\n"
-                        "Extract structured write intentions (task creation, issue creation, calendar events) from the user query and recent conversation history.\n"
-                        "CRITICAL: If the user says 'create these tasks', 'create those', 'yes confirm', 'assign them to me', or refers to tasks/issues mentioned by the assistant in recent messages, EXTRACT all of those specific tasks/issues from the context into the tasks list!\n"
-                        "Clean up task/issue names (e.g. 'KAN-5 payment failed' -> title: 'payment failed' or 'KAN-5 payment failed', 'task named-task-101' -> title: 'task-101'). Do not add placeholder description text."
+                        "Extract structured write intentions (task creation, issue creation, calendar events) from the user query, recent conversation history, and any attached PRD/document.\n\n"
+                        "CRITICAL RULES:\n"
+                        "1. PRD / DOCUMENT EXTRACTION:\n"
+                        "   - If an attached PRD/document is provided and the user asks to create/extract tasks (e.g. 'create tasks from it', 'make tasks from this PRD', 'extract tasks'):\n"
+                        "     * Set is_task_creation=True.\n"
+                        "     * Extract all key actionable development tasks from the PRD with clean, descriptive titles (e.g. 'Setup JWT Authentication Flow', 'Implement Stripe Webhook Listener'), contextual descriptions, and priorities ('high', 'medium', 'low').\n"
+                        "   - If the user asks to create/extract issues or bugs from the document:\n"
+                        "     * Set is_issue_creation=True.\n"
+                        "     * Extract distinct bugs, blockers, or issues with descriptive titles, descriptions, and severity ('critical', 'high', 'medium', 'low').\n"
+                        "2. CONVERSATION CONTEXT EXTRACTION:\n"
+                        "   - If the user says 'create these tasks', 'create those', 'yes confirm', 'assign them to me', or refers to tasks/issues mentioned by the assistant in recent messages, EXTRACT all of those specific tasks/issues from the context into the tasks list!\n"
+                        "3. FORMATTING:\n"
+                        "   - Clean up task/issue names (e.g. 'KAN-5 payment failed' -> title: 'payment failed'). Do not use generic placeholders like 'Task 1' if real titles exist in the PRD."
                     )),
-                    HumanMessage(content=f"Recent Conversation History:\n{convo_context}\n\nLatest User Query: '{user_query}'"),
+                    HumanMessage(content=f"Recent Conversation History:\n{convo_context}{doc_context}\n\nLatest User Query: '{user_query}'"),
                 ]
                 extracted: DBWriteIntentExtraction = await extractor_llm.ainvoke(extraction_prompt)
 
