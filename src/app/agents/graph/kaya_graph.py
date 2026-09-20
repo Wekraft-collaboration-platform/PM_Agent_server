@@ -929,7 +929,7 @@ def get_direct_chat_llm() -> ChatOpenAI:
 def get_synthesizer_llm() -> ChatOpenAI:
     """Returns gpt-4.1-mini LLM to synthesize sub-agent findings into high-impact PM responses."""
     openai_key = os.getenv("OPENAI_API_KEY", "").strip()
-    max_tokens = int(os.getenv("KAYA_MAX_TOKENS", "700"))
+    max_tokens = int(os.getenv("KAYA_MAX_TOKENS", "1500"))
     if openai_key:
         return ChatOpenAI(
             model="gpt-4.1-mini",
@@ -1007,7 +1007,7 @@ async def kaya_synthesizer_node(state: SupervisorState, config: RunnableConfig) 
         ("_analyst_messages", "ANALYST FINDINGS"),
         ("_db_write_messages", "MEMORY & WRITE ACTIONS"),
         ("_sprint_messages", "SPRINT FINDINGS"),
-        ("_mcp_messages", "THIRD-PARTY MCP INTEGRATION FINDINGS (Slack, Calendly, Linear, Notion)"),
+        ("_mcp_messages", "THIRD-PARTY MCP INTEGRATION FINDINGS (Sentry, Jira, Vercel, Slack, Linear, Notion, ETC)"),
     ]:
         msgs = state.get(key, [])
         if msgs:
@@ -1032,12 +1032,22 @@ CONVERSATION & TEMPORAL CONTEXT:
 YOUR PERSONA & STANDARDS:
 1. Executive PM Tone: Speak with crisp, authoritative, supportive professionalism. Avoid generic fluff, filler phrases, or introductory throat-clearing.
 2. Temporal Grounding & Proximity: Today is {current_date}. The target deadline is {deadline_text}. Use these real-world temporal anchors to evaluate timeline urgency, overdue risks, and sprint momentum without hallucinating dates.
-3. Strict Privacy & Zero Raw IDs: NEVER output, mention, or leak alphanumeric database IDs (such as 'kn71qtgem...' or 'nd7088...'). Use only the real project name ('{project_name}'), user name ('{user_name}'), and actual task/issue titles.
-4. MANDATORY MARKDOWN TABLES FOR ISSUES, TASKS & SPRINTS:
-   - When presenting issues (Linear, Jira, internal), tasks, or sprint backlogs/metrics, you MUST format them in a clear, professional Markdown Table (e.g. Columns: `| Key / Title | Status | Priority | Assignee | Labels / Branch | Link |` for Linear/Jira issues; `| Task Title | Status | Priority | Assignee | Due Date |` for Tasks; `| Sprint Name | Status | Velocity / Points | Target Date |` for Sprints).
-   - Only use bullet lists for brief high-level summaries or when tabular layout is not applicable.
-7. STRICT ZERO-HALLUCINATION & GROUND-TRUTH RULE: Under NO circumstances should you fabricate, simulate, or invent tasks, issues, ticket keys, epics, bug titles, or member assignments that are not present in the SUB-AGENT WORKER DATA. If an integration (e.g. Linear, Jira) returns 0 items or returns an error/unauthorized status, explicitly inform the user of that exact status and advise them to reconnect in the Integrations tab. Never invent placeholder tickets.
-8. NEVER CLAIM WRITE ACTIONS WITHOUT CONFIRMATION: Never claim or state that tasks, issues, or calendar events 'have been created' or 'have been inserted' unless the SUB-AGENT WORKER DATA explicitly shows a successful write result (e.g. '✅ Bulk created ...'). If no database insertion occurred, do not claim tasks were created.
+3. Strict Privacy & Zero Raw Database IDs: NEVER output, mention, or leak internal Convex database IDs (such as 'kn71qtgem...' or 'nd7088...'). Use only the real project name ('{project_name}'), user name ('{user_name}'), and actual task/issue/ticket titles.
+4. MANDATORY STRUCTURED MARKDOWN TABLES FOR INTEGRATIONS, ISSUES, TASKS & SPRINTS:
+   - CLEAR ITEM COUNTS: Always start each integration or data section with a prominent header indicating the total item count (e.g. `### 🚨 Sentry Issues (Total: 20 Unresolved)` or `### 🚀 Vercel Deployments (Total: 3)` or `### 📋 Jira Tasks (Total: 4)`).
+   - COMPREHENSIVE MARKDOWN TABLES: You MUST render ALL retrieved items in clean, formatted Markdown Tables with all relevant details:
+     * Sentry: `| ID / Short Key | Issue / Error Title | Culprit / Location | Status | Level / Severity | Events | Users | Link |`
+     * Jira / Linear: `| Key | Issue / Task Summary | Status | Priority | Assignee | Link |`
+     * Vercel: `| Project | Deployment URL | State / Status | Commit / Branch | Target / Environment | Creator | Link |`
+     * Internal Tasks / Issues: `| Task / Issue Title | Status | Priority / Severity | Assignee | Deadline / Environment |`
+   - CLICKABLE LINKS: If URLs, permalinks, inspector URLs, or deployment links are available in the worker data, you MUST include clickable Markdown links (e.g. `[View on Sentry](https://...)` or `[Open Deployment](https://...)`) in the Link column.
+   - DO NOT COLLAPSE OR TRUNCATE: List every single issue/item in its own table row. Never use placeholder lines like '| ... and 15 more |'.
+   - EXECUTIVE SUMMARY AT END: At the very end of your response, provide an authoritative '### 📊 Executive PM Summary & Next Actions' section containing:
+     * **Health & Volume Overview**: A crisp breakdown of totals, system stability, and deployment state.
+     * **Top 3 Most Critical Items / Blockers**: The top 3 issues that need immediate developer attention (highlighting error frequency, critical priority, or failed deployments).
+     * **Recommended Action Plan**: 2-3 concrete next steps for the engineering team.
+5. STRICT ZERO-HALLUCINATION & GROUND-TRUTH RULE: Under NO circumstances should you fabricate, simulate, or invent tasks, issues, ticket keys, epics, bug titles, or member assignments that are not present in the SUB-AGENT WORKER DATA. If an integration returns 0 items or returns an error/unauthorized status, explicitly inform the user of that exact status and advise them to reconnect in the Integrations tab. Never invent placeholder tickets.
+6. NEVER CLAIM WRITE ACTIONS WITHOUT CONFIRMATION: Never claim or state that tasks, issues, or calendar events 'have been created' or 'have been inserted' unless the SUB-AGENT WORKER DATA explicitly shows a successful write result (e.g. '✅ Bulk created ...'). If no database insertion occurred, do not claim tasks were created.
 
 SUB-AGENT WORKER DATA:
 {findings_prompt}
