@@ -530,6 +530,7 @@ async def analyst_worker_node(state: SupervisorState, config: RunnableConfig) ->
             "_analyst_messages": [RESET_SENTINEL, {"role": "analyst", "content": findings_text}],
             "standup_data": standup_data if need_standup else None,
             "project_insights": project_data,
+            "file_id": file_id,
         }
 
     except GraphInterrupt:
@@ -614,7 +615,7 @@ async def db_write_worker_node(state: SupervisorState, config: RunnableConfig) -
                 if doc_data and doc_data.get("parsed_markdown"):
                     filename = doc_data.get("file_name", "Uploaded PRD")
                     doc_md = doc_data.get("parsed_markdown", "")
-                    doc_context = f"\n\nATTACHED PRD / SPECIFICATION DOCUMENT ({filename}):\n{doc_md[:25000]}\n"
+                    doc_context = f"\n\nATTACHED PRD / SPECIFICATION DOCUMENT ({filename}):\n{doc_md[:60000]}\n"
                     print(f"[DB WRITE WORKER] Ingested attached PRD '{filename}' ({len(doc_md)} chars) for task/issue extraction.")
             except Exception as doc_err:
                 print(f"[DB WRITE WORKER] Error reading doc cache: {doc_err}")
@@ -629,12 +630,11 @@ async def db_write_worker_node(state: SupervisorState, config: RunnableConfig) -
 
         if any(k in lower_query for k in write_keywords) or bool(doc_context):
             try:
-                groq_api_key = os.getenv("GROQ_API_KEY", "")
-                extractor_model = os.getenv("GROQ_ROUTER_MODEL", "openai/gpt-oss-120b")
+                openai_api_key = os.getenv("OPENAI_API_KEY", "")
+                extractor_model = os.getenv("EXTRACTOR_MODEL", "gpt-4.1-nano")
                 extractor_llm = ChatOpenAI(
                     model=extractor_model,
-                    openai_api_key=groq_api_key,
-                    openai_api_base="https://api.groq.com/openai/v1",
+                    openai_api_key=openai_api_key,
                     temperature=0.0,
                 ).with_structured_output(DBWriteIntentExtraction)
 
@@ -650,19 +650,19 @@ async def db_write_worker_node(state: SupervisorState, config: RunnableConfig) -
                 extraction_prompt = [
                     SystemMessage(content=(
                         f"Today's Date: {datetime.now().strftime('%Y-%m-%d')}.\n"
-                        "Extract structured write intentions (task creation, issue creation, calendar events) from the user query, recent conversation history, and any attached PRD/document.\n\n"
-                        "CRITICAL RULES:\n"
-                        "1. PRD / DOCUMENT EXTRACTION:\n"
-                        "   - If an attached PRD/document is provided and the user asks to create/extract tasks (e.g. 'create tasks from it', 'make tasks from this PRD', 'extract tasks'):\n"
-                        "     * Set is_task_creation=True.\n"
-                        "     * Extract all key actionable development tasks from the PRD with clean, descriptive titles (e.g. 'Setup JWT Authentication Flow', 'Implement Stripe Webhook Listener'), contextual descriptions, and priorities ('high', 'medium', 'low').\n"
-                        "   - If the user asks to create/extract issues or bugs from the document:\n"
-                        "     * Set is_issue_creation=True.\n"
-                        "     * Extract distinct bugs, blockers, or issues with descriptive titles, descriptions, and severity ('critical', 'high', 'medium', 'low').\n"
-                        "2. CONVERSATION CONTEXT EXTRACTION:\n"
-                        "   - If the user says 'create these tasks', 'create those', 'yes confirm', 'assign them to me', or refers to tasks/issues mentioned by the assistant in recent messages, EXTRACT all of those specific tasks/issues from the context into the tasks list!\n"
-                        "3. FORMATTING:\n"
-                        "   - Clean up task/issue names (e.g. 'KAN-5 payment failed' -> title: 'payment failed'). Do not use generic placeholders like 'Task 1' if real titles exist in the PRD."
+                        "You are the DB Write Action Extractor. Your job is to extract structured tasks, issues, or calendar events to be created in the database.\n\n"
+                        "CRITICAL EXTRACTION RULES:\n"
+                        "1. TASK CREATION TRIGGER:\n"
+                        "   - If the user asks to create tasks, add tasks, make tasks, or says 'create tasks of those please !', 'create these tasks', 'create those', 'yes create', 'yes confirm', or 'extract tasks':\n"
+                        "     * ALWAYS set is_task_creation=True.\n"
+                        "     * Extract all actionable tasks from the attached PRD (if provided) OR from the Assistant's previous messages/tables in conversation history into the `tasks` list.\n"
+                        "     * Populate each task with a clean, concise title, contextual description, and priority ('high', 'medium', 'low').\n"
+                        "2. ISSUE CREATION TRIGGER:\n"
+                        "   - If the user asks to create issues, log bugs, or says 'create issues of those', 'create issues for these blockers':\n"
+                        "     * ALWAYS set is_issue_creation=True.\n"
+                        "     * Extract all bugs/issues from the document or previous messages into `issues` with title, description, and severity ('critical', 'high', 'medium', 'low').\n"
+                        "3. TITLES & DESCRIPTIONS:\n"
+                        "   - Keep task titles concise and actionable (e.g. 'Fix dispute-hold release bug', 'Audit and fix IAM segregation-of-duties violations'). Never return an empty task list if items were discussed or exist in the PRD."
                     )),
                     HumanMessage(content=f"Recent Conversation History:\n{convo_context}{doc_context}\n\nLatest User Query: '{user_query}'"),
                 ]
@@ -840,6 +840,7 @@ async def db_write_worker_node(state: SupervisorState, config: RunnableConfig) -
 
         return {
             "_db_write_messages": [RESET_SENTINEL, {"role": "db_write", "content": summary_text}],
+            "file_id": file_id,
         }
 
     except GraphInterrupt:
