@@ -43,6 +43,10 @@ DEFAULT_MCP_URLS: Dict[str, str] = {
     "hubspot": "https://mcp.hubspot.com",
     "vercel": "https://mcp.vercel.com",
     "github": "https://mcp.github.com",
+    "supabase": "https://mcp.supabase.com/mcp",
+    "neon": "https://mcp.neon.tech/mcp",
+    "stripe": "https://mcp.stripe.com",
+    "posthog": "https://mcp.posthog.com/mcp",
 }
 
 # Connector category keywords for intent-based Smart Tool Pruning
@@ -73,6 +77,18 @@ CONNECTOR_KEYWORDS: Dict[str, List[str]] = {
     ],
     "github": [
         "github", "pull request", "pr", "repo", "repository", "commit", "branch", "release"
+    ],
+    "supabase": [
+        "supabase", "sql", "database", "table", "schema", "postgres", "edge function", "storage", "migration", "query", "row"
+    ],
+    "neon": [
+        "neon", "database", "postgres", "branch", "serverless", "sql", "migration", "neon db", "connection string"
+    ],
+    "stripe": [
+        "stripe", "payment", "invoice", "charge", "subscription", "customer", "payout", "refund", "billing", "card"
+    ],
+    "posthog": [
+        "posthog", "analytics", "funnel", "event", "feature flag", "experiment", "trend", "user path", "cohort", "telemetry"
     ],
 }
 
