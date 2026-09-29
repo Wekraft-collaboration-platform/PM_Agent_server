@@ -80,6 +80,10 @@ class SupervisorState(TypedDict):
     pending_action_payload: Optional[Dict[str, Any]]
     mutation_receipt: Optional[Dict[str, Any]]
 
+    # 7. Declarative Skills Integration (Selected by Groq 120b Router)
+    selected_skill: Optional[str]
+    active_skill_content: Optional[str]
+
 
 class KayaState(MessagesState):
     """
@@ -120,4 +124,9 @@ class KayaState(MessagesState):
     active_intent: Optional[str]
     pending_action_payload: Optional[Dict[str, Any]]
     mutation_receipt: Optional[Dict[str, Any]]
+
+    # Declarative Skills Integration
+    selected_skill: Optional[str]
+    active_skill_content: Optional[str]
+
 

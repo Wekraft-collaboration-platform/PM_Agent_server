@@ -29,10 +29,11 @@ async def convex_post_async(endpoint: str, payload: dict) -> dict:
             r = await client.post(f"{convex_url}/{endpoint.lstrip('/')}", json=payload, timeout=12)
             r.raise_for_status()
             data = r.json()
-            print(f"[CONVEX TOOL] ✓ Completed '{endpoint}' successfully.")
+            print(f"[CONVEX TOOL] [OK] Completed '{endpoint}' successfully.")
             return data
     except Exception as e:
-        print(f"[CONVEX TOOL] ✗ Error requesting '{endpoint}': {e}")
+        safe_e = str(e).encode("ascii", "replace").decode("ascii")
+        print(f"[CONVEX TOOL] [FAIL] Error requesting '{endpoint}': {safe_e}")
         raise
 
 
@@ -45,11 +46,13 @@ def convex_post_sync(endpoint: str, payload: dict) -> dict:
             r = client.post(f"{convex_url}/{endpoint.lstrip('/')}", json=payload, timeout=10)
             r.raise_for_status()
             data = r.json()
-            print(f"[CONVEX TOOL] ✓ Completed '{endpoint}' successfully.")
+            print(f"[CONVEX TOOL] [OK] Completed '{endpoint}' successfully.")
             return data
     except Exception as e:
-        print(f"[CONVEX TOOL] ✗ Error requesting '{endpoint}': {e}")
+        safe_e = str(e).encode("ascii", "replace").decode("ascii")
+        print(f"[CONVEX TOOL] [FAIL] Error requesting '{endpoint}': {safe_e}")
         raise
+
 
 
 
@@ -363,3 +366,132 @@ SPRINT_TOOLS = [
 ]
 
 ALL_TOOLS = DBWRITE_TOOLS + ANALYST_TOOLS + SPRINT_TOOLS
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SKILLS FETCHING & LEVEL 1 METADATA HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+DEFAULT_SKILLS_FALLBACK = [
+    {
+        "name": "sentry_error_triage",
+        "title": "Sentry Error Triage & Root Cause Analysis",
+        "connectorId": "sentry",
+        "description": "Discovers Sentry organizations, fetches unresolved production errors with bounded queries, identifies culprit routes, and isolates critical system crashes.",
+        "content": """---
+name: sentry_error_triage
+title: Sentry Error Triage & Root Cause Analysis
+description: Discovers Sentry organizations, fetches unresolved production errors with bounded queries, identifies culprit routes, and isolates critical system crashes.
+connectorId: sentry
+createdBy: default
+version: 1.0.0
+---
+
+# Sentry Error Triage Skill
+
+## Context & Objectives
+This skill governs how Kaya and MCP sub-agents query live Sentry instances to diagnose unresolved exceptions, trace offending routes, measure affected user blast-radius, and prioritize production incidents.
+
+## Discovery & Prerequisites Protocol
+1. Never guess the Organization Slug: Always run find_organizations first to discover the real active slug.
+2. Verify Target Project: Execute find_projects with the discovered organizationSlug. Match with the active project or target repository.
+
+## Step-by-Step Tool Execution Workflow
+1. Step 1 - Discover Organization: Tool: find_organizations
+2. Step 2 - Discover Project Slugs: Tool: find_projects
+3. Step 3 - Query Unresolved Issues (Bounded): Tool: search_issues with {"query": "is:unresolved", "sort": "date"}
+4. Step 4 - Deep Dive on Outlier Issues (Optional): Tool: get_sentry_resource or analyze_issue_with_seer
+
+## Strict Anti-Hallucination & Execution Rules
+- No Fabricated Error Counts: You must only report exact events and users numbers returned by Sentry.
+- Link Preservation: Always extract and provide the direct Sentry dashboard permalink.
+- Finalize execution with finalize_result containing data, resolved_context, and summary.
+""",
+    },
+    {
+        "name": "linear_issue_management",
+        "title": "Linear Issue Sync & Safe Ticket Creation",
+        "connectorId": "linear",
+        "description": "Discovers Linear workspace teams, lists active/backlog tickets without truncation, safely creates tickets with required team UUIDs, and verifies creation.",
+        "content": """---
+name: linear_issue_management
+title: Linear Issue Sync & Safe Ticket Creation
+description: Discovers Linear workspace teams, lists active/backlog tickets without truncation, safely creates tickets with required team UUIDs, and verifies creation.
+connectorId: linear
+createdBy: default
+version: 1.0.0
+---
+
+# Linear Issue Management Skill
+
+## Context & Objectives
+This skill instructs Kaya and MCP sub-agents on how to interact with Linear: discovering workspace teams, synchronizing active/backlog issues, safely creating new tickets with required team identifiers, and preventing duplicate tickets.
+
+## Discovery & Prerequisites Protocol
+1. Team ID is Mandatory for Mutations: Linear requires a valid team UUID to create any issue. Always invoke list_teams if teamId is unknown.
+2. Never guess IDs: Never pass an arbitrary string as team without verifying it via list_teams.
+
+## Step-by-Step Tool Execution Workflow
+1. Step 1 - Team Discovery: Tool: list_teams
+2. Step 2 - Sync Active Issues: Tool: list_issues (filter status != completed/canceled)
+3. Step 3 - Safe Issue Creation: Tool: save_issue with discovered team ID
+4. Step 4 - Read-After-Write Verification: Tool: list_issues to verify created issue key
+
+## Strict Anti-Hallucination & Execution Rules
+- No Speculative Creation: Never claim an issue was created until save_issue returns a valid payload.
+- Deduplication Check: Cross-reference existing ticket titles before creating.
+- Finalize execution with finalize_result containing data, resolved_context, and summary.
+""",
+    },
+    {
+        "name": "incident_escalation_triage",
+        "title": "Cross-App Production Incident Escalation",
+        "connectorId": "sentry, linear, project",
+        "description": "Coordinates Sentry telemetry, Linear ticketing, and internal project issues to escalate critical production crashes (>10 events) into actionable engineering tickets.",
+        "content": """---
+name: incident_escalation_triage
+title: Cross-App Production Incident Escalation
+description: Coordinates Sentry telemetry, Linear ticketing, and internal project issues to escalate critical production crashes (>10 events) into actionable engineering tickets.
+connectorId: sentry, linear, project
+createdBy: default
+version: 1.0.0
+---
+
+# Cross-App Incident Escalation Skill
+
+## Context & Objectives
+Coordinates Sentry telemetry, Linear ticketing, and internal project database to detect critical production anomalies and escalate them to the backlog.
+
+## Incident Escalation Thresholds
+An error is Escalation-Ready when:
+1. events >= 10 OR users >= 3 in Sentry.
+2. OR error is an unhandled fatal crash.
+3. AND no open issue currently exists in Linear or internal project database.
+
+## Step-by-Step Multi-System Workflow
+1. Phase 1 - Telemetry Ingestion: Query Sentry for active unresolved crashes.
+2. Phase 2 - Deduplication & Existing Issue Scan: Check open Linear tickets and internal project issues.
+3. Phase 3 - Ticket Escalation: If untracked, invoke save_issue via Linear MCP or stage internal project issue.
+4. Phase 4 - Verification & Audit Log: Verify creation via list_issues.
+- Finalize execution with finalize_result containing incident summary and escalation receipts.
+""",
+    },
+]
+
+
+async def fetch_active_skills_async(user_id: str = "") -> List[Dict[str, Any]]:
+    """
+    Fetches active skills (Level 1 metadata + content) for the user from Convex HTTP backend.
+    Falls back to platform default skills if backend is unreachable.
+    """
+    try:
+        data = await convex_post_async("getActiveSkills", {"userId": user_id or None})
+        skills = data.get("skills") if isinstance(data, dict) else data
+        if isinstance(skills, list) and skills:
+            print(f"[FETCH SKILLS] [OK] Retrieved {len(skills)} skill(s) from Convex DB.")
+            return skills
+    except Exception as e:
+        safe_e = str(e).encode("ascii", "replace").decode("ascii")
+        print(f"[FETCH SKILLS] Notice: Could not fetch skills from Convex endpoint ({safe_e}), using default skills catalog.")
+    return DEFAULT_SKILLS_FALLBACK
+

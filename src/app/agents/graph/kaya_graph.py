@@ -21,7 +21,7 @@ import os
 import json
 import asyncio
 from datetime import datetime
-from typing import List, Dict, Any, Optional, Union
+from typing import List, Dict, Any, Optional, Union, Tuple
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
@@ -48,6 +48,7 @@ from app.agents.tools.tools import (
     fetch_sprint_insights_async,
     fetch_project_insights_async,
     fetch_scheduler_async,
+    fetch_active_skills_async,
     write_calendar_event_to_convex,
     write_sprint_to_convex,
     write_items_to_sprint,
@@ -70,18 +71,27 @@ class SupervisorDecision(BaseModel):
     actions: List[str] = Field(
         description=(
             "List of sub-agent actions to trigger in parallel (select ONLY the sub-agents explicitly required):\n"
-            "- 'mcp': ONLY for third-party external integrations (explicitly requested Jira, Linear, Slack, Calendly, Notion, MCP). NEVER call for internal project tasks/issues/sprints or if user hasn't asked for third party.\n"
+            "- 'mcp': ONLY for third-party external integrations (explicitly requested Jira, Linear, Slack, Calendly, Notion, Sentry, Vercel, MCP). NEVER call for internal project tasks/issues/sprints or if user hasn't asked for third party.\n"
             "- 'db_write': DB Write agent for creating tasks, issues, calendar events, or report schedulers in this project\n"
             "- 'analyst': Project Analyst agent for internal project read analytics: user daily standup, task summaries, issue tracking, member workloads, project health, deadlines\n"
             "- 'sprint': Sprint agent for sprint insights/velocity, active sprint status, sprint creation, or backlog item assignments\n"
             "- 'direct_response': simple greeting, casual conversation, or general product manager chat"
         )
     )
-    reasoning: str = Field(description="Clear reasoning for the routing decision.")
+    selected_skill: Optional[str] = Field(
+        default=None,
+        description=(
+            "Name of the SINGLE best matching skill from the Available Skills Catalog, "
+            "or null if no specialized procedural skill applies."
+        )
+    )
+    reasoning: str = Field(description="Clear reasoning for the sub-agent and skill routing choice.")
 
 
-ROUTER_SYSTEM_PROMPT = """You are the primary Supervisor Router for the WEKRAFT AI Platform.
-Analyze the user's incoming query (and previous query context if provided) and decide strictly which specialized sub-agent workers to trigger.
+ROUTER_SYSTEM_PROMPT = """You are the Master Supervisor Router for the WEKRAFT AI Platform.
+Analyze the user's incoming query (and previous query context if provided) and make two decisions:
+1. Select the exact sub-agents required ('actions').
+2. Select the SINGLE most appropriate procedural skill ('selected_skill') from the Available Skills Catalog, or null if none match.
 
 CRITICAL RULES:
 1. CREATING TASKS, ISSUES, SPRINTS IN THIS PROJECT:
@@ -90,7 +100,7 @@ CRITICAL RULES:
    - NEVER call 'mcp' for creating tasks, issues, or sprints unless the user explicitly specifies an external third-party destination (e.g., 'create issue in Jira', 'create ticket in Linear'). Even if issues are based on previous Sentry errors, creating them is an internal project action.
 
 2. THIRD-PARTY / MCP AGENT ('mcp'):
-   - ONLY call 'mcp' if the user EXPLICITLY asks for a third-party app or external tool (Jira, Linear, Slack, Calendly, Notion, external service, MCP), OR if the current query is a follow-up referring back to a third-party app mentioned in the previous query (e.g., Previous: 'get me all tasks from Jira', Current: 'i want issues also from that' -> 'mcp').
+   - ONLY call 'mcp' if the user EXPLICITLY asks for a third-party app or external tool (Jira, Linear, Slack, Calendly, Notion, Sentry, Vercel, external service, MCP), OR if the current query is a follow-up referring back to a third-party app mentioned in the previous query.
    - NEVER call 'mcp' for general project tasks, issues, sprints, or standups if no third-party integration was mentioned in either the current or previous query.
 
 3. SPRINT AGENT ('sprint'):
@@ -98,36 +108,49 @@ CRITICAL RULES:
 
 4. MINIMAL SUB-AGENT CALLS:
    - NEVER call extra sub-agents if not asked by the user. Route ONLY to the exact sub-agents necessary to fulfill the user's request.
-   - Example 1: 'create issues for these sentry errors' -> ['db_write'] (NO 'mcp').
-   - Example 2: 'what are my tasks/issues and sprints' -> ['analyst', 'sprint'] (NO 'mcp').
-   - Example 3: 'show my tasks and standup' -> ['analyst'] (NO 'sprint', NO 'mcp').
-   - Example 4: 'how is the current sprint doing' -> ['sprint'] (NO 'analyst', NO 'mcp').
-   - Example 5: 'check jira tickets and slack' -> ['mcp'].
-   - Example 6: 'hi how are you' -> ['direct_response'].
 
-Available Actions:
+5. SELECTING AT MOST 1 PROCEDURAL SKILL:
+   - Evaluate the Available Skills Catalog (Level 1 Metadata).
+   - If the task matches a specialized workflow, choose ONLY the SINGLE purest matching skill.
+   - If no specialized skill applies (e.g. casual conversation or generic query), set selected_skill to null.
+
+Available Sub-Agents:
 1. 'mcp': Third-party SaaS integrations ONLY (Jira, Linear, Slack, Calendly, Notion, Sentry, HubSpot, Vercel).
 2. 'db_write': DB Write agent for project mutations: internal task creation, issue creation, calendar event scheduling, report scheduler setup.
 3. 'analyst': Project Analyst agent for internal read-only analytics: User daily standup, task summaries, issue tracking, member workloads, project health, or project deadlines/timelines.
 4. 'sprint': Sprint velocity, active sprint progress, sprint creation, or backlog item allocation.
 5. 'direct_response': Greetings (hi, hello), casual conversation, or general questions requiring no live database queries.
+
+Available Skills Catalog (Level 1 Metadata):
+{SKILLS_CATALOG_BLOCK}
 """
 
 
 async def route_user_request(
     user_input: str,
     project_id: Optional[str] = None,
+    user_id: Optional[str] = None,
     has_attached_doc: bool = False,
-) -> SupervisorDecision:
-    """Evaluates user input using Groq 120b LLM router and outputs structured SupervisorDecision with deterministic safeguards."""
+) -> Tuple[SupervisorDecision, Optional[str]]:
+    """Evaluates user input using Groq 120b LLM router, outputs structured SupervisorDecision, and returns matched skill content."""
     groq_api_key = os.getenv("GROQ_API_KEY", "")
-    # Ensure 120b model is used for the router (openai/gpt-oss-120b)
     router_model = os.getenv("GROQ_ROUTER_MODEL", "openai/gpt-oss-120b")
+
+    # Level 1: Fetch active skills catalog
+    active_skills = await fetch_active_skills_async(user_id or "")
+    catalog_lines = [
+        f"- Skill: '{s.get('name', '')}' (Connectors: {s.get('connectorId', 'general')})\n  Description: {s.get('description', '')}"
+        for s in active_skills
+        if s.get("name")
+    ]
+    skills_catalog_block = "\n".join(catalog_lines) if catalog_lines else "No specialized skills registered."
 
     doc_hint = "\n[Notice: An uploaded PRD/specification document is attached in this session.]" if has_attached_doc else ""
 
+    formatted_system_prompt = ROUTER_SYSTEM_PROMPT.replace("{SKILLS_CATALOG_BLOCK}", skills_catalog_block)
+
     messages = [
-        SystemMessage(content=ROUTER_SYSTEM_PROMPT),
+        SystemMessage(content=formatted_system_prompt),
         HumanMessage(content=f"User Query Context:\n{user_input}{doc_hint}\n| Active Project ID: {project_id or 'none'}"),
     ]
 
@@ -164,39 +187,15 @@ async def route_user_request(
                 if "direct_response" in decision.actions:
                     decision.actions.remove("direct_response")
 
-        # Check for internal creation intent vs external third-party destination
-        creation_verbs = ["create", "add", "make", "insert", "generate", "schedule", "new", "extract"]
-        creation_nouns = ["task", "tasks", "issue", "issues", "bug", "bugs", "sprint", "sprints", "event", "meeting", "these", "those"]
-        is_internal_creation = any(v in lower_latest for v in creation_verbs) and any(n in lower_latest for n in creation_nouns)
-        mcp_explicit_targets = ["jira", "linear", "slack", "calendly", "notion", "hubspot", "vercel", "mcp", "atlassian"]
-        has_explicit_mcp_in_latest = any(k in lower_latest for k in mcp_explicit_targets)
+        # Third-party overrides
+        mcp_keywords = ["jira", "linear", "slack", "calendly", "notion", "hubspot", "sentry", "vercel", "github"]
+        if any(k in lower_latest for k in mcp_keywords):
+            if "mcp" not in decision.actions:
+                if "direct_response" in decision.actions:
+                    decision.actions.remove("direct_response")
+                decision.actions.append("mcp")
 
-        # Rule 1: Internal creation routing (Task / Issue -> db_write, Sprint -> sprint)
-        if is_internal_creation and not has_explicit_mcp_in_latest:
-            if any(n in lower_latest for n in ["task", "tasks", "issue", "issues", "bug", "bugs", "event", "meeting", "these", "those"]):
-                if "db_write" not in decision.actions:
-                    decision.actions.append("db_write")
-            if any(n in lower_latest for n in ["sprint", "sprints"]):
-                if "sprint" not in decision.actions:
-                    decision.actions.append("sprint")
-            if "mcp" in decision.actions:
-                decision.actions.remove("mcp")
-            if "direct_response" in decision.actions:
-                decision.actions.remove("direct_response")
-
-        # Rule 2 Deterministic Safeguard: Never call MCP unless explicitly requested
-        elif not has_explicit_mcp_in_latest:
-            if "mcp" in decision.actions:
-                decision.actions.remove("mcp")
-                if not decision.actions:
-                    decision.actions = ["analyst"]
-        elif has_explicit_mcp_in_latest and "mcp" not in decision.actions:
-            if "direct_response" in decision.actions:
-                decision.actions.remove("direct_response")
-            decision.actions.append("mcp")
-            decision.reasoning += " (MCP auto-included due to explicit keyword match)"
-
-        # Rule 3 Deterministic Safeguard: Always call sprint agent for sprint queries
+        # Sprint overrides
         sprint_keywords = ["sprint", "sprints", "velocity", "backlog", "burndown"]
         if any(k in lower_latest for k in sprint_keywords):
             if "sprint" not in decision.actions:
@@ -209,9 +208,17 @@ async def route_user_request(
         if len(decision.actions) > 1 and "direct_response" in decision.actions:
             decision.actions.remove("direct_response")
 
+        # Hydrate matched skill content
+        matched_content: Optional[str] = None
+        if decision.selected_skill:
+            for s in active_skills:
+                if s.get("name") == decision.selected_skill:
+                    matched_content = s.get("content")
+                    break
+
         safe_reasoning = decision.reasoning.encode("ascii", "replace").decode("ascii")
-        print(f"[ROUTER DECISION] Actions: {decision.actions} | Reasoning: {safe_reasoning}")
-        return decision
+        print(f"\n🎯 [ROUTER DECISION] Actions: {decision.actions} | Selected Skill: {decision.selected_skill or 'None'} | Reasoning: {safe_reasoning}\n")
+        return decision, matched_content
 
     except Exception as e:
         safe_err = str(e).encode("ascii", "replace").decode("ascii")
@@ -228,15 +235,18 @@ async def route_user_request(
             actions.append("db_write")
         elif any(k in lower_latest for k in ["task", "tasks", "issue", "issues", "standup", "workload", "health", "project", "critical", "prd", "doc"]):
             actions.append("analyst")
-        if any(k in lower_latest for k in ["jira", "linear", "slack", "calendly", "notion", "hubspot", "vercel", "mcp"]):
+        if any(k in lower_latest for k in ["jira", "linear", "slack", "calendly", "notion", "hubspot", "vercel", "sentry", "mcp"]):
             actions.append("mcp")
         if not actions:
             actions = ["direct_response"]
 
-        return SupervisorDecision(
+        fallback_decision = SupervisorDecision(
             actions=actions,
+            selected_skill=None,
             reasoning=f"Fallback routing: {safe_err}",
         )
+        return fallback_decision, None
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -289,6 +299,7 @@ def _emit_stream_status(
     subagent_called: Optional[str] = None,
     tool_called: Optional[str] = None,
     caller: Optional[str] = None,
+    skill_activated: Optional[str] = None,
 ):
     """Emits custom SSE progress event for frontend status indicator."""
     try:
@@ -305,6 +316,8 @@ def _emit_stream_status(
             payload["tool_called"] = tool_called
             if caller:
                 payload["caller"] = caller
+        if skill_activated:
+            payload["skill_activated"] = skill_activated
         if payload:
             writer(payload)
     except Exception:
@@ -320,13 +333,25 @@ async def supervisor_router_node(state: SupervisorState, config: RunnableConfig)
     messages = state.get("messages", [])
     user_query = _get_router_user_query(messages)
     project_id = state.get("project_id")
+    user_id = state.get("user_id")
     file_id = state.get("file_id")
 
     _emit_stream_status(status_text="Kaya is thinking...")
-    decision = await route_user_request(user_query, project_id, has_attached_doc=bool(file_id))
+    decision, matched_content = await route_user_request(
+        user_query,
+        project_id=project_id,
+        user_id=user_id,
+        has_attached_doc=bool(file_id),
+    )
 
     # Immediately emit reasoning event so frontend displays it right after thinking
     _emit_stream_status(status_text="Kaya is reasoning...", reasoning=decision.reasoning)
+
+    if decision.selected_skill:
+        _emit_stream_status(
+            status_text=f"Loaded procedural skill: '{decision.selected_skill}'",
+            skill_activated=decision.selected_skill,
+        )
 
     # Emit subagent delegation events for actions selected
     for action in decision.actions:
@@ -343,6 +368,8 @@ async def supervisor_router_node(state: SupervisorState, config: RunnableConfig)
         "next": decision.actions,
         "router_reasoning": decision.reasoning,
         "action_type": decision.actions[0] if len(decision.actions) == 1 else "multi_agent",
+        "selected_skill": decision.selected_skill,
+        "active_skill_content": matched_content,
     }
 
 
@@ -394,25 +421,37 @@ async def analyst_worker_node(state: SupervisorState, config: RunnableConfig) ->
         }
 
     try:
-        # Determine parallel tool fetch requirements based on user query
-        need_standup = any(k in user_query for k in ["standup", "my task", "assigned", "my issue", "today", "to do"])
-        need_workload = any(k in user_query for k in ["workload", "team", "members", "who is working", "capacity"])
+        # Determine specific tools needed based on user query
+        has_task_kw = any(k in user_query for k in ["task", "tasks", "todo", "to-do", "to do", "assigned", "backlog", "story", "stories"])
+        has_issue_kw = any(k in user_query for k in ["issue", "issues", "bug", "bugs", "error", "errors", "crash", "sentry", "linear", "defect", "incident", "problem", "problems", "fail", "failure", "unresolved"])
+        has_standup_kw = any(k in user_query for k in ["standup", "my standup", "today's work", "what did i do", "what should i do"])
+        has_workload_kw = any(k in user_query for k in ["workload", "team", "members", "who is working", "capacity", "distribution"])
+        has_timeline_kw = any(k in user_query for k in ["timeline", "deadline", "milestone", "due date", "when is", "schedule"])
+        is_general_query = not (has_task_kw or has_issue_kw or has_standup_kw or has_workload_kw or has_timeline_kw)
 
-        # Emit live tool call events
-        _emit_stream_status(tool_called="get_tasks_summary", caller="Project analyst")
-        _emit_stream_status(tool_called="get_issues_summary", caller="Project analyst")
-        _emit_stream_status(tool_called="get_project_insights", caller="Project analyst")
+        need_tasks = has_task_kw or is_general_query
+        need_issues = has_issue_kw or is_general_query
+        need_standup = has_standup_kw
+        need_workload = has_workload_kw
+        need_timeline = has_timeline_kw or is_general_query
+
+        if need_tasks:
+            _emit_stream_status(tool_called="get_tasks_summary", caller="Project analyst")
+        if need_issues:
+            _emit_stream_status(tool_called="get_issues_summary", caller="Project analyst")
+        if need_timeline:
+            _emit_stream_status(tool_called="get_project_insights", caller="Project analyst")
         if need_standup:
             _emit_stream_status(tool_called="get_user_standup", caller="Project analyst")
         if need_workload:
             _emit_stream_status(tool_called="get_member_workload", caller="Project analyst")
 
-        # Execute read tools in parallel concurrently
-        tasks_future = fetch_tasks_summary_async(project_id)
-        issues_future = fetch_issues_summary_async(project_id)
-        project_future = fetch_project_insights_async(project_id)
-        standup_future = fetch_user_standup_async(project_id, user_id) if need_standup else asyncio.sleep(0, result={})
-        workload_future = fetch_member_workload_async(project_id) if need_workload else asyncio.sleep(0, result={})
+        # Execute read tools in parallel concurrently (only those actually needed)
+        tasks_future = fetch_tasks_summary_async(project_id) if need_tasks else asyncio.sleep(0, result=None)
+        issues_future = fetch_issues_summary_async(project_id) if need_issues else asyncio.sleep(0, result=None)
+        project_future = fetch_project_insights_async(project_id) if need_timeline else asyncio.sleep(0, result=None)
+        standup_future = fetch_user_standup_async(project_id, user_id) if need_standup else asyncio.sleep(0, result=None)
+        workload_future = fetch_member_workload_async(project_id) if need_workload else asyncio.sleep(0, result=None)
 
         tasks_res, issues_res, project_res, standup_res, workload_res = await asyncio.gather(
             tasks_future, issues_future, project_future, standup_future, workload_future, return_exceptions=True
@@ -428,44 +467,46 @@ async def analyst_worker_node(state: SupervisorState, config: RunnableConfig) ->
         # Build clean structured summary for Kaya Synthesis
         lines = ["### Analyst Sub-Agent Findings:"]
 
-        # Tasks Section
-        if "error" in tasks_data:
-            lines.append(f"- **Tasks Summary**: ⚠️ {tasks_data['error']}")
-        else:
-            total = tasks_data.get("totalCount", tasks_data.get("total", 0))
-            completed = tasks_data.get("completedCount", 0)
-            blocked = tasks_data.get("blockedCount", 0)
-            active_tasks = tasks_data.get("criticalAndActiveTasks", [])
-            in_prog = sum(1 for t in active_tasks if "prog" in str(t.get("status", "")).lower())
-            todo = sum(1 for t in active_tasks if "start" in str(t.get("status", "")).lower() or "todo" in str(t.get("status", "")).lower())
-            lines.append(f"- **Tasks Breakdown**: Total Tasks: {total} | In Progress: {in_prog} | To-Do: {todo} | Completed: {completed} | Blocked: {blocked}")
-            if active_tasks:
-                lines.append("  **Active Tasks List**:")
-                for t in active_tasks:
-                    title = t.get("title", "Untitled")
-                    status = t.get("status", "unknown")
-                    prio = t.get("priority", "normal")
-                    assignees = ", ".join(t.get("assignees", [])) or "Unassigned"
-                    lines.append(f"  • '{title}' | Status: {status} | Priority: {prio} | Assignee: {assignees}")
+        # Tasks Section (only if tasks were requested)
+        if tasks_data is not None:
+            if "error" in tasks_data:
+                lines.append(f"- **Tasks Summary**: ⚠️ {tasks_data['error']}")
+            else:
+                total = tasks_data.get("totalCount", tasks_data.get("total", 0))
+                completed = tasks_data.get("completedCount", 0)
+                blocked = tasks_data.get("blockedCount", 0)
+                active_tasks = tasks_data.get("criticalAndActiveTasks", [])
+                in_prog = sum(1 for t in active_tasks if "prog" in str(t.get("status", "")).lower())
+                todo = sum(1 for t in active_tasks if "start" in str(t.get("status", "")).lower() or "todo" in str(t.get("status", "")).lower())
+                lines.append(f"- **Tasks Breakdown**: Total Tasks: {total} | In Progress: {in_prog} | To-Do: {todo} | Completed: {completed} | Blocked: {blocked}")
+                if active_tasks:
+                    lines.append("  **Active Tasks List**:")
+                    for t in active_tasks:
+                        title = t.get("title", "Untitled")
+                        status = t.get("status", "unknown")
+                        prio = t.get("priority", "normal")
+                        assignees = ", ".join(t.get("assignees", [])) or "Unassigned"
+                        lines.append(f"  • '{title}' | Status: {status} | Priority: {prio} | Assignee: {assignees}")
 
-        # Issues Section
-        if "error" in issues_data:
-            lines.append(f"- **Issues Summary**: ⚠️ {issues_data['error']}")
-        else:
-            total_issues = issues_data.get("totalCount", issues_data.get("total", 0))
-            critical = issues_data.get("criticalCount", 0)
-            active_issues = issues_data.get("activeIssues", [])
-            lines.append(f"- **Active Issues Breakdown**: Total Issues: {total_issues} | Critical Blockers: {critical}")
-            if active_issues:
-                lines.append("  **Active Issues List**:")
-                for iss in active_issues:
-                    title = iss.get("title", "Untitled")
-                    sev = iss.get("severity", "medium")
-                    status = iss.get("status", "opened")
-                    lines.append(f"  • '{title}' | Severity: {sev} | Status: {status}")
+        # Issues Section (only if issues were requested)
+        if issues_data is not None:
+            if "error" in issues_data:
+                lines.append(f"- **Issues Summary**: ⚠️ {issues_data['error']}")
+            else:
+                total_issues = issues_data.get("totalCount", issues_data.get("total", 0))
+                critical = issues_data.get("criticalCount", 0)
+                active_issues = issues_data.get("activeIssues", [])
+                lines.append(f"- **Active Issues Breakdown**: Total Issues: {total_issues} | Critical Blockers: {critical}")
+                if active_issues:
+                    lines.append("  **Active Issues List**:")
+                    for iss in active_issues:
+                        title = iss.get("title", "Untitled")
+                        sev = iss.get("severity", "medium")
+                        status = iss.get("status", "opened")
+                        lines.append(f"  • '{title}' | Severity: {sev} | Status: {status}")
 
-        # Project Timeline Section
-        if "error" not in project_data and project_data:
+        # Project Timeline Section (only if requested)
+        if project_data is not None and "error" not in project_data and project_data:
             p_name = project_data.get("projectName", "Active Project")
             deadline = project_data.get("deadline") or "Not set"
             days_left = project_data.get("daysRemaining")
@@ -960,11 +1001,13 @@ async def mcp_worker_node(state: SupervisorState, config: RunnableConfig) -> Dic
         }
 
     try:
-        # Execute MCP agent workflow with smart pruning and live token fetching
+        # Execute MCP agent workflow with smart pruning, live token fetching, and declarative skill execution
         mcp_result = await execute_mcp_agent_workflow(
             project_id=project_id,
             user_query=user_query,
             user_name=user_name,
+            active_skill_content=state.get("active_skill_content"),
+            selected_skill=state.get("selected_skill"),
         )
 
         summary = mcp_result.get("summary", "No MCP data retrieved.")
@@ -1122,6 +1165,12 @@ async def kaya_synthesizer_node(state: SupervisorState, config: RunnableConfig) 
     active_error = state.get("active_error")
     error_instructions = f"\nNote: Active service error notice: {active_error}. Acknowledge this gracefully." if active_error else ""
 
+    active_skill_content = state.get("active_skill_content")
+    selected_skill = state.get("selected_skill")
+    skill_guidance = ""
+    if active_skill_content and selected_skill:
+        skill_guidance = f"\nACTIVE PROCEDURAL SKILL GUIDELINES ({selected_skill}):\n{active_skill_content.strip()}\n"
+
     system_prompt = f"""You are Kaya, an Executive Technical Project Manager on the WEKRAFT Platform.
 You are actively managing the project "{project_name}".
 
@@ -1131,7 +1180,7 @@ CONVERSATION & TEMPORAL CONTEXT:
 - Project Target Deadline: {deadline_text}
 - User Name: {user_name}
 {error_instructions}
-
+{skill_guidance}
 YOUR PERSONA & STANDARDS:
 1. Executive PM Tone: Speak with crisp, authoritative, supportive professionalism. Avoid generic fluff, filler phrases, or introductory throat-clearing.
 2. Temporal Grounding & Proximity: Today is {current_date}. The target deadline is {deadline_text}. Use these real-world temporal anchors to evaluate timeline urgency, overdue risks, and sprint momentum without hallucinating dates.
@@ -1160,10 +1209,6 @@ SUB-AGENT WORKER DATA:
 
     messages = [SystemMessage(content=system_prompt)] + list(state.get("messages", []))
     response = await llm.ainvoke(messages)
-
-    print("\n" + "=" * 70)
-    print(f"[KAYA FINAL PM SYNTHESIS RESPONSE]\n{response.content}")
-    print("=" * 70 + "\n")
 
     return {"messages": [response]}
 

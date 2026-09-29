@@ -422,6 +422,8 @@ async def _execute_single_app_worker(
     llm: Any,
     timeout_s: float = DEFAULT_WORKER_TIMEOUT_S,
     step_budget: int = DEFAULT_STEP_BUDGET,
+    active_skill_content: Optional[str] = None,
+    selected_skill: Optional[str] = None,
 ) -> WorkerResult:
     """
     Runs an isolated sub-agent loop strictly for ONE connector.
@@ -437,7 +439,11 @@ async def _execute_single_app_worker(
 
     try:
         return await asyncio.wait_for(
-            _run_worker_loop(c_id, mcp_url, token, meta, user_query, llm, step_budget),
+            _run_worker_loop(
+                c_id, mcp_url, token, meta, user_query, llm, step_budget,
+                active_skill_content=active_skill_content,
+                selected_skill=selected_skill,
+            ),
             timeout=timeout_s,
         )
     except asyncio.TimeoutError:
@@ -456,6 +462,8 @@ async def _run_worker_loop(
     user_query: str,
     llm: Any,
     step_budget: int,
+    active_skill_content: Optional[str] = None,
+    selected_skill: Optional[str] = None,
 ) -> WorkerResult:
     """Core ReAct loop for a single connector with dynamic tool discovery and structured finalization."""
     discovered_tools = await fetch_mcp_tools_list_session(mcp_url, token)
@@ -545,14 +553,24 @@ async def _run_worker_loop(
     if meta.get("region"):
         context_hints.append(f"Region: '{meta['region']}'")
 
-    workspace_context_hint = " | ".join(context_hints) if context_hints else ""
-    if workspace_context_hint:
-        workspace_context_hint = f"Known Connection Metadata: {workspace_context_hint}."
+    workspace_context_hint = f"Known Connection Metadata: {' | '.join(context_hints)}." if context_hints else ""
+
+    skill_injection = ""
+    if active_skill_content:
+        skill_name_display = selected_skill or "Active Procedural Skill"
+        skill_injection = (
+            f"\n\n=== AUTHORITATIVE PROCEDURAL SKILL MANUAL: {skill_name_display} ===\n"
+            f"{active_skill_content.strip()}\n"
+            f"=========================================================================\n"
+            f"INSTRUCTION: You MUST adhere to the Step-by-Step Workflow and Anti-Hallucination rules defined in the Skill Manual above.\n"
+        )
+
 
     system_prompt = (
         f"You are the dedicated {c_id.capitalize()} Sub-Agent for WEKRAFT.\n"
         f"Task: Retrieve live third-party data to satisfy the user query: '{user_query}'.\n"
         f"{workspace_context_hint}\n"
+        f"{skill_injection}"
         f"Tools with no required parameters are Discovery Tools: {discovery_names}.\n"
         f"Rules:\n"
         f"1. You MUST call retrieval tool(s) to fetch real workspace data. Do not provide a speculative text answer.\n"
@@ -678,12 +696,15 @@ async def execute_mcp_agent_workflow(
     user_query: str,
     user_name: Optional[str] = None,
     per_app_timeout_s: float = DEFAULT_WORKER_TIMEOUT_S,
+    active_skill_content: Optional[str] = None,
+    selected_skill: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Executes Generic Parallel MCP Sub-Agent Architecture:
     1. Discovers active project connections from Convex and routes via smart token matching.
     2. Spawns isolated, concurrent sub-agent workers per connected app via asyncio.gather().
-    3. Aggregates structured data, tool logs, failure states, and zero-hallucination Markdown summary.
+    3. Ingests active procedural skill manual (if selected) into sub-agent execution.
+    4. Aggregates structured data, tool logs, failure states, and zero-hallucination Markdown summary.
     """
     if not project_id:
         return {
@@ -731,6 +752,8 @@ async def execute_mcp_agent_workflow(
             user_query=user_query,
             llm=llm,
             timeout_s=per_app_timeout_s,
+            active_skill_content=active_skill_content,
+            selected_skill=selected_skill,
         )
         for conn in target_connections
     ]
