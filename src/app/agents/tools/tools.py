@@ -78,15 +78,15 @@ def get_user_standup(project_id: str, user_id: str) -> dict:
 
 @tool
 def get_tasks_summary(project_id: str) -> dict:
-    """Fetch a high-level summary of all tasks including critical and active ones.
-    Useful for getting a quick overview of project health and identifying bottlenecks.
+    """Fetch a slim summary of project tasks. Returns:
+    - tasks[]: list of { title, assignee, deadlineStatus, priority }
+    - totalCount, completedCount, blockedCount
     """
     print(f"[get_tasks_summary] querying — project={project_id}")
     try:
         data = convex_post_sync("getTasksSummary", {"projectId": project_id})
-        summary = data.get("tasksSummary", {})
-        print(f"[get_tasks_summary] ✓ returned")
-        return summary
+        print(f"[get_tasks_summary] ✓ returned {len(data.get('tasks', []))} tasks")
+        return data
     except Exception as e:
         print(f"[get_tasks_summary] ✗ ERROR: {e}")
         return {"error": str(e)}
@@ -184,7 +184,7 @@ async def fetch_user_standup_async(project_id: str, user_id: str) -> dict:
 async def fetch_tasks_summary_async(project_id: str) -> dict:
     try:
         data = await convex_post_async("getTasksSummary", {"projectId": project_id})
-        return data.get("tasksSummary", {}) or {"status": "empty", "message": "No tasks found."}
+        return data if data else {"status": "empty", "message": "No tasks found."}
     except Exception as e:
         return {"error": f"Tasks summary fetch error: {e}"}
 
@@ -450,6 +450,154 @@ An error is Escalation-Ready when:
 4. Phase 4 - Verification & Audit Log: Verify creation via list_issues.
 - Finalize execution with finalize_result containing incident summary and escalation receipts.
 """,
+    },
+    {
+        "name": "cross_platform_issue_triage_notion_sync",
+        "title": "Linear & Sentry Issue Triage & Notion Sync",
+        "connectorId": "linear, sentry, notion",
+        "description": "Fetches active issues from Linear and unresolved production errors from Sentry, aggregates them into structured markdown tables, and creates a Notion page.",
+        "content": """---
+name: cross_platform_issue_triage_notion_sync
+title: Linear & Sentry Issue Triage & Notion Sync
+connectorId: linear, sentry, notion
+version: 1.3.0
+---
+
+# Linear & Sentry Issue Triage & Notion Sync
+
+## Execution Steps
+1. Linear -> call list_issues with {}. Extract id, title, priority, state, url.
+2. Sentry -> call find_organizations -> capture organizationSlug -> call search_issues with {organizationSlug, query: "is:unresolved", sort: "date"}. Extract error title, culprit, event count, url.
+3. Notion -> call notion-create-pages with {creation_mode: "draft", allow_async: false, pages: [{properties: {title: "Linear & Sentry Issue Triage - Live Sync"}, content: "<markdown>", icon: "📊"}]}. Capture returned id and url.
+4. Finalize -> call finalize_result with the created Notion page URL and issue counts.
+
+## Rules
+- Only output IDs, URLs, and counts that appear verbatim in tool responses. Never invent keys or links.
+- End with finalize_result containing the Notion page URL, issue counts, and top-priority highlights.
+
+## Execution Configuration
+```json
+{
+  "maxSteps": 2,
+  "pinnedTools": {
+    "linear": [
+      {
+        "name": "list_issues",
+        "description": "List all Linear issues. Returns issues array with id, title, priority, state, url.",
+        "inputSchema": { "type": "object", "properties": {}, "required": [] }
+      }
+    ],
+    "sentry": [
+      {
+        "name": "find_organizations",
+        "description": "Find Sentry orgs. Returns organizations array each with a slug. Call first before search_issues.",
+        "inputSchema": { "type": "object", "properties": {}, "required": [] }
+      },
+      {
+        "name": "search_issues",
+        "description": "Search Sentry issues. Requires organizationSlug. Use query 'is:unresolved', sort 'date'.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "organizationSlug": { "type": "string" },
+            "query": { "type": "string" },
+            "sort": { "type": "string" }
+          },
+          "required": ["organizationSlug", "query"]
+        }
+      }
+    ],
+    "notion": [
+      {
+        "name": "notion-create-pages",
+        "description": "Create Notion pages. Pass creation_mode 'draft', allow_async false for sync id return.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "pages": { "type": "array", "items": { "type": "object" } },
+            "creation_mode": { "type": "string", "enum": ["draft"] },
+            "allow_async": { "type": "boolean" }
+          },
+          "required": ["pages"]
+        }
+      }
+    ]
+  }
+}
+```""",
+    },
+    {
+        "name": "jira_project_tasks_alignment_notion_sync",
+        "title": "Project & Jira Tasks Alignment & Notion Action Plan",
+        "connectorId": "jira, notion, project",
+        "description": "Fetches internal project tasks and live Jira tasks via JQL, performs cross-system alignment and workload gap analysis, generates actionable insights and recommended actions, and publishes a structured report to Notion.",
+        "content": """---
+name: jira_project_tasks_alignment_notion_sync
+title: Project & Jira Tasks Alignment & Notion Action Plan
+connectorId: jira, notion, project
+version: 1.0.0
+---
+
+# Project & Jira Tasks Alignment & Notion Action Plan
+
+## Context & Objectives
+This skill coordinates internal project tasks and external Jira Kanban/Scrum tasks to identify unassigned items, status mismatches, and delivery blockers, synthesizing them into actionable insights and publishing a strategic plan to Notion.
+
+## Step-by-Step Execution Workflow
+1. Jira Discovery: Call getAccessibleAtlassianResources with {} to resolve cloudId.
+2. Jira Tasks Query: Call searchJiraIssuesUsingJql with:
+   Default JQL: { "cloudId": "<discovered_cloudId>", "jql": "status IS NOT NULL ORDER BY updated DESC", "maxResults": 20 }
+   (Do not filter by project='...' by default so it works for any workspace without project key mismatch).
+   If User Specified Project: Use jql "project = '<KeyOrName>' AND status IS NOT NULL ORDER BY updated DESC". If error, fall back to "status IS NOT NULL ORDER BY updated DESC".
+   Important: Search with status IS NOT NULL to retrieve all active tasks (including unassigned items). Extract key, summary, status.name, priority.name, assignee.displayName.
+3. Internal Project Tasks: Ingest active project tasks, priorities, assignees, and deadlines.
+4. Strategic Synthesis: Formulate 3-5 concrete Actionable Insights and 2-3 immediate Recommended Actions.
+5. Notion Publication: Call notion-create-pages with draft creation_mode and the structured markdown content.
+6. Finalization Handshake: Call finalize_result with created Notion page URL and strategic highlights.
+
+## Execution Configuration
+```json
+{
+  "maxSteps": 2,
+  "pinnedTools": {
+    "jira": [
+      {
+        "name": "getAccessibleAtlassianResources",
+        "description": "Discover accessible Atlassian cloudId and resources. Call first before running JQL.",
+        "inputSchema": { "type": "object", "properties": {}, "required": [] }
+      },
+      {
+        "name": "searchJiraIssuesUsingJql",
+        "description": "Search Jira issues using JQL. Pass cloudId and bounded jql 'status IS NOT NULL ORDER BY updated DESC'.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "cloudId": { "type": "string" },
+            "jql": { "type": "string" },
+            "maxResults": { "type": "number" }
+          },
+          "required": ["cloudId", "jql"]
+        }
+      }
+    ],
+    "notion": [
+      {
+        "name": "notion-create-pages",
+        "description": "Create Notion pages. Pass creation_mode 'draft', allow_async false for sync id return.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "pages": { "type": "array", "items": { "type": "object" } },
+            "creation_mode": { "type": "string", "enum": ["draft"] },
+            "allow_async": { "type": "boolean" }
+          },
+          "required": ["pages"]
+        }
+      }
+    ]
+  }
+}
+```""",
     },
 ]
 
