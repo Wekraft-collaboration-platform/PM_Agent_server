@@ -221,15 +221,6 @@ async def fetch_project_insights_async(project_id: str) -> dict:
         return {"error": f"Project insights fetch error: {e}"}
 
 
-async def fetch_scheduler_async(project_id: str) -> dict:
-    try:
-        data = await convex_post_async("getScheduler", {"projectId": project_id})
-        scheduler = data.get("scheduler")
-        return {"exists": False} if not scheduler else {"exists": True, **scheduler}
-    except Exception as e:
-        return {"error": f"Scheduler fetch error: {e}"}
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # WRITE / HITL SCHEMA DESCRIPTOR TOOLS (@tool)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -262,12 +253,6 @@ def create_sprint(
 @tool
 def add_items_to_sprint(sprint_id: str) -> str:
     """Trigger the item selection UI so the user can pick tasks for the sprint."""
-    return "intercepted"
-
-
-@tool
-def setup_report_scheduler(project_id: str) -> str:
-    """Open or view the report scheduler form for a project."""
     return "intercepted"
 
 
@@ -310,15 +295,6 @@ async def write_items_to_sprint(sprint_id: str, task_ids: list) -> str:
         return f"❌ Failed to add tasks to sprint: {e}"
 
 
-async def write_scheduler_to_convex(payload: dict) -> str:
-    """Actual HTTP call to Convex for scheduler configuration after HITL approval."""
-    try:
-        result = await convex_post_async("createOrUpdateScheduler", payload)
-        return f"✅ Scheduler saved (id: {result.get('id', 'unknown')})"
-    except Exception as e:
-        return f"❌ Failed to save scheduler: {e}"
-
-
 async def write_bulk_tasks_to_convex(payload: dict) -> str:
     """Actual HTTP call to Convex for bulk task insertion after HITL approval."""
     try:
@@ -344,7 +320,6 @@ async def write_bulk_issues_to_convex(payload: dict) -> str:
 # All Mutation / Write / HITL Tools
 DBWRITE_TOOLS = [
     create_calendar_event,
-    setup_report_scheduler,
     bulk_create_tasks,
     bulk_create_issues,
 ]

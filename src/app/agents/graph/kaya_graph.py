@@ -47,12 +47,10 @@ from app.agents.tools.tools import (
     fetch_member_workload_async,
     fetch_sprint_insights_async,
     fetch_project_insights_async,
-    fetch_scheduler_async,
     fetch_active_skills_async,
     write_calendar_event_to_convex,
     write_sprint_to_convex,
     write_items_to_sprint,
-    write_scheduler_to_convex,
     write_bulk_tasks_to_convex,
     write_bulk_issues_to_convex,
 )
@@ -72,7 +70,7 @@ class SupervisorDecision(BaseModel):
         description=(
             "List of sub-agent actions to trigger in parallel (select ONLY the sub-agents explicitly required):\n"
             "- 'mcp': ONLY for third-party external integrations (explicitly requested Jira, Linear, Slack, Calendly, Notion, Sentry, Vercel, MCP). NEVER call for internal project tasks/issues/sprints or if user hasn't asked for third party.\n"
-            "- 'db_write': DB Write agent for creating tasks, issues, calendar events, or report schedulers in this project\n"
+            "- 'db_write': DB Write agent for creating tasks, issues, or calendar events in this project\n"
             "- 'analyst': Project Analyst agent for internal project read analytics: user daily standup, task summaries, issue tracking, member workloads, project health, deadlines\n"
             "- 'sprint': Sprint agent for sprint insights/velocity, active sprint status, sprint creation, or backlog item assignments\n"
             "- 'direct_response': simple greeting, casual conversation, or general product manager chat"
@@ -638,15 +636,6 @@ async def db_write_worker_node(state: SupervisorState, config: RunnableConfig) -
     lines = ["### DB Write Sub-Agent Findings:"]
 
     try:
-
-        # Check for report scheduler queries
-        if "scheduler" in user_query.lower() or "report" in user_query.lower():
-            _emit_stream_status(tool_called="get_scheduler", caller="DB Write agent")
-            scheduler_info = await fetch_scheduler_async(project_id)
-            if scheduler_info:
-                exists = scheduler_info.get("exists", False)
-                lines.append(f"- **Scheduler Status**: {'Active scheduler configured' if exists else 'No active report scheduler configured'}")
-
         # Retrieve attached PRD document from cache if present
         file_id = state.get("file_id")
         doc_context = ""
