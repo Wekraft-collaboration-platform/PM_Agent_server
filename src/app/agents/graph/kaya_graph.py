@@ -186,7 +186,7 @@ async def route_user_request(
                     decision.actions.remove("direct_response")
 
         # Third-party overrides
-        mcp_keywords = ["jira", "linear", "slack", "calendly", "notion", "hubspot", "sentry", "vercel", "github"]
+        mcp_keywords = ["jira", "linear", "slack", "calendly", "notion", "hubspot", "sentry", "vercel", "github", "pr", "prs", "pull request", "repo", "repository", "codebase", "branch", "commit"]
         if any(k in lower_latest for k in mcp_keywords):
             if "mcp" not in decision.actions:
                 if "direct_response" in decision.actions:
@@ -233,7 +233,7 @@ async def route_user_request(
             actions.append("db_write")
         elif any(k in lower_latest for k in ["task", "tasks", "issue", "issues", "standup", "workload", "health", "project", "critical", "prd", "doc"]):
             actions.append("analyst")
-        if any(k in lower_latest for k in ["jira", "linear", "slack", "calendly", "notion", "hubspot", "vercel", "sentry", "mcp"]):
+        if any(k in lower_latest for k in ["jira", "linear", "slack", "calendly", "notion", "hubspot", "vercel", "sentry", "github", "pr", "prs", "repo", "repository", "codebase", "branch", "commit", "mcp"]):
             actions.append("mcp")
         if not actions:
             actions = ["direct_response"]

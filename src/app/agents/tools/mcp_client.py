@@ -42,7 +42,7 @@ DEFAULT_MCP_URLS: Dict[str, str] = {
     "sentry": "https://mcp.sentry.dev/mcp",
     "hubspot": "https://mcp.hubspot.com",
     "vercel": "https://mcp.vercel.com",
-    "github": "https://mcp.github.com",
+    "github": "https://api.githubcopilot.com/mcp",
     "supabase": "https://mcp.supabase.com/mcp",
     "neon": "https://mcp.neon.tech/mcp",
     "stripe": "https://mcp.stripe.com",
@@ -76,7 +76,7 @@ CONNECTOR_KEYWORDS: Dict[str, List[str]] = {
         "vercel", "deployment", "deploy", "domain", "project", "env", "environment", "build", "alias", "preview"
     ],
     "github": [
-        "github", "pull request", "pr", "repo", "repository", "commit", "branch", "release"
+        "github", "pull request", "pull requests", "pr", "prs", "repo", "repository", "codebase", "commit", "commits", "branch", "branches", "release", "releases", "merge", "git", "diff", "review", "code"
     ],
     "supabase": [
         "supabase", "sql", "database", "table", "schema", "postgres", "edge function", "storage", "migration", "query", "row"
@@ -568,8 +568,48 @@ async def _run_worker_loop(
         context_hints.append(f"Known Team ID: '{meta['teamId']}'")
     if meta.get("region"):
         context_hints.append(f"Region: '{meta['region']}'")
+    if meta.get("repoFullName") or meta.get("repoName"):
+        repo_val = meta.get("repoFullName") or meta.get("repoName")
+        context_hints.append(f"Connected GitHub Repository: '{repo_val}'")
+    if meta.get("repoOwner"):
+        context_hints.append(f"Repo Owner: '{meta['repoOwner']}'")
+    if meta.get("repoId") or meta.get("repositoryId") or meta.get("githubId"):
+        r_id = meta.get("repoId") or meta.get("repositoryId") or meta.get("githubId")
+        context_hints.append(f"Repo ID: '{r_id}'")
 
     workspace_context_hint = f"Known Connection Metadata: {' | '.join(context_hints)}." if context_hints else ""
+
+    github_scope_instruction = ""
+    if c_id == "github":
+        connected_repo_full = meta.get("repoFullName") or ""
+        connected_repo_name = meta.get("repoName") or ""
+        connected_repo_owner = meta.get("repoOwner") or ""
+        connected_repo_id = meta.get("repoId") or meta.get("repositoryId") or meta.get("githubId") or ""
+
+        if not connected_repo_owner and "/" in connected_repo_full:
+            connected_repo_owner = connected_repo_full.split("/")[0]
+        if not connected_repo_name and "/" in connected_repo_full:
+            connected_repo_name = connected_repo_full.split("/")[1]
+
+        target_repo_label = connected_repo_full or (f"{connected_repo_owner}/{connected_repo_name}" if connected_repo_owner and connected_repo_name else connected_repo_name)
+
+        if target_repo_label:
+            github_scope_instruction = (
+                f"\n\n🚨 STRICT SCOPE CONSTRAINT FOR GITHUB:\n"
+                f"You are strictly authorized and scoped ONLY to the project's connected repository: '{target_repo_label}'.\n"
+                f"- Repository Name: '{connected_repo_name}'\n"
+                f"- Repository Owner: '{connected_repo_owner}'\n"
+                f"- Repository ID / GitHub ID: '{connected_repo_id}'\n"
+                f"RULES:\n"
+                f"1. You MUST ONLY fetch, list, inspect, and summarize PRs, commits, branches, issues, and code for this specific connected repository ('{target_repo_label}').\n"
+                f"2. NEVER query or return details for any other repository in GitHub.\n"
+                f"3. Always pass owner='{connected_repo_owner}' and repo='{connected_repo_name or target_repo_label}' (or repo='{target_repo_label}') in all GitHub tool parameters.\n"
+            )
+        else:
+            github_scope_instruction = (
+                f"\n\n🚨 GITHUB REPOSITORY SCOPE NOTICE:\n"
+                f"No specific repository is bound to this project in the database. Look for the repository matching project '{meta.get('projectName', '')}' or notify the user.\n"
+            )
 
     skill_injection = ""
     if active_skill_content:
@@ -581,11 +621,11 @@ async def _run_worker_loop(
             f"INSTRUCTION: You MUST adhere to the Step-by-Step Workflow and Anti-Hallucination rules defined in the Skill Manual above.\n"
         )
 
-
     system_prompt = (
         f"You are the dedicated {c_id.capitalize()} Sub-Agent for WEKRAFT.\n"
         f"Task: Retrieve live third-party data to satisfy the user query: '{user_query}'.\n"
         f"{workspace_context_hint}\n"
+        f"{github_scope_instruction}"
         f"{skill_injection}"
         f"Tools with no required parameters are Discovery Tools: {discovery_names}.\n"
         f"Rules:\n"
