@@ -287,7 +287,23 @@ async def execute_mcp_tool_call_session(
 
             return {"content": str(data.get("raw_text") or data), "isError": False}
 
+        except httpx.HTTPStatusError as http_err:
+            status = http_err.response.status_code
+            if status in (401, 403):
+                return {
+                    "error": f"Authentication expired (HTTP {status} Unauthorized). Access token is expired or revoked. Please click 'Reconnect' in the Integrations tab.",
+                    "isError": True,
+                    "isAuthError": True,
+                }
+            return {"error": f"HTTP {status} error from MCP server: {http_err}", "isError": True}
         except Exception as err:
+            err_msg = str(err)
+            if "401" in err_msg or "unauthorized" in err_msg.lower():
+                return {
+                    "error": "Authentication expired (HTTP 401 Unauthorized). Access token is expired. Please click 'Reconnect' in the Integrations tab.",
+                    "isError": True,
+                    "isAuthError": True,
+                }
             return {"error": str(err), "isError": True}
 
 
@@ -310,6 +326,8 @@ async def _call_tool_with_retry(
                 arguments=args,
             )
             if not res.get("isError"):
+                return res
+            if res.get("isAuthError"):
                 return res
             last_err = res.get("error", "Unknown tool error")
         except Exception as e:
@@ -340,16 +358,21 @@ async def fetch_project_mcp_connections_async(project_id: str) -> List[Dict[str,
         return []
 
 
-def smart_prune_connectors(user_query: str, active_connections: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def smart_prune_connectors(
+    user_query: str,
+    active_connections: List[Dict[str, Any]],
+    active_skill_content: Optional[str] = None,
+    selected_skill: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     """
-    Generic routing matching query tokens against connectorId, displayName, and tokens.
-    Derives tokens at runtime from connection objects without relying on noisy stopwords.
-    Fails open (returns all active connections) if no specific app is named, so broad queries succeed.
+    Matches query tokens or active skill against connectorId, displayName, and tokens.
+    Returns matching connectors, or empty list if no third-party apps are targeted.
+    Only queries all connectors if the user explicitly asks for general integrations/mcp.
     """
     if not active_connections:
         return []
 
-    q = user_query.lower()
+    q = (user_query + " " + (selected_skill or "") + " " + (active_skill_content or "")).lower()
     matched = []
     generic_stopwords = {"workspace", "monitoring", "deployments", "integration", "app", "tools", "issue", "task", "project", "tickets"}
 
@@ -365,8 +388,15 @@ def smart_prune_connectors(user_query: str, active_connections: List[Dict[str, A
         if any(tok and tok in q for tok in tokens):
             matched.append(c)
 
-    # Fail open: if no specific connector matched by name, query all active connections
-    return matched if matched else active_connections
+    if matched:
+        return matched
+
+    # Explicit general MCP / integrations keywords check
+    general_mcp_keywords = ["mcp", "integrations", "connected apps", "all apps", "external tools", "all tools", "third-party", "external integrations"]
+    if any(k in user_query.lower() for k in general_mcp_keywords):
+        return active_connections
+
+    return []
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -430,6 +460,50 @@ def _prune_tools_for_query(
     return discovery + selected_action
 
 
+def _filter_tools_by_skill(
+    discovered_tools: List[Dict[str, Any]],
+    skill_content: str,
+    connector_id: str = "",
+) -> List[Dict[str, Any]]:
+    """
+    If a procedural skill is active, restrict discovered MCP tools STRICTLY to those mentioned in the skill.
+    This prevents tool explosion (e.g. 44 Notion tools) and completely prevents the model from wandering
+    into unwanted discovery/search tools (like notion-ai-search) when the skill dictates exact action tools.
+    """
+    if not skill_content or not discovered_tools:
+        return discovered_tools
+
+    skill_text = skill_content.lower()
+    matched = []
+
+    for tool in discovered_tools:
+        raw_name = tool.get("name", "")
+        if not raw_name:
+            continue
+
+        norm_name = raw_name.lower()
+        norm_hyphen = norm_name.replace("_", "-")
+        norm_underscore = norm_name.replace("-", "_")
+
+        # Match exact name or hyphen/underscore variants in skill markdown
+        if (
+            f"`{norm_name}`" in skill_text
+            or f"`{norm_hyphen}`" in skill_text
+            or f"`{norm_underscore}`" in skill_text
+            or f"tool: {norm_name}" in skill_text
+            or f"tool: {norm_hyphen}" in skill_text
+            or f"tool: {norm_underscore}" in skill_text
+            or f"**tool:** {norm_name}" in skill_text
+            or f"**tool:** {norm_hyphen}" in skill_text
+            or f"**tool:** {norm_underscore}" in skill_text
+            or norm_name in skill_text
+            or norm_hyphen in skill_text
+        ):
+            matched.append(tool)
+
+    return matched if matched else discovered_tools
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 4. SKILL CONFIG EXTRACTOR (Pinned-Tool & Budget Parser)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -462,7 +536,7 @@ def _extract_skill_config(
                     "max_steps": parsed.get("maxSteps"),
                 }
     except Exception:
-        pass  # Any failure → graceful fallback to explore mode
+        pass  # Any failure → graceful fallback to live discovery
     return None
 
 
@@ -521,34 +595,45 @@ async def _run_worker_loop(
 ) -> WorkerResult:
     """Core ReAct loop for a single connector with dynamic tool discovery and structured finalization."""
 
-    # ── SMART DISCOVERY: Pinned-mode (skill has exact tools) vs Explore-mode (live discovery) ──
+    # ── SMART DISCOVERY: Skill-driven mode vs Freeform Explore mode ──
     effective_budget = step_budget
     discovered_tools: List[Dict[str, Any]] = []
 
     skill_cfg = _extract_skill_config(active_skill_content or "", c_id) if active_skill_content else None
     if skill_cfg and skill_cfg.get("tools"):
-        # Pinned mode — skip HTTP discovery; use pre-validated minimal tool schemas from skill.
-        # This eliminates 3 HTTP calls × N connectors and removes huge tool-schema token cost.
+        # Explicit pinned schemas in skill JSON
         discovered_tools = skill_cfg["tools"]
         if skill_cfg.get("max_steps"):
             effective_budget = min(int(skill_cfg["max_steps"]), step_budget)
-        logger.info(f"[MCP AGENT] {c_id}: 📌 Pinned mode — {len(discovered_tools)} tools, budget={effective_budget}")
+        logger.info(f"[MCP AGENT] {c_id}: 📌 Pinned mode (schema) — {len(discovered_tools)} tools, budget={effective_budget}")
     else:
-        # Explore mode — full live discovery for freeform / unknown queries.
-        discovered_tools = await fetch_mcp_tools_list_session(mcp_url, token)
-        if not discovered_tools and meta.get("tools"):
-            discovered_tools = [
+        # Live tool discovery from MCP server
+        all_live_tools = await fetch_mcp_tools_list_session(mcp_url, token)
+        if not all_live_tools and meta.get("tools"):
+            all_live_tools = [
                 {"name": t, "description": f"Tool {t} on {c_id.capitalize()}", "inputSchema": {}}
                 for t in meta.get("tools", [])
             ]
-        logger.info(f"[MCP AGENT] {c_id}: 🔍 Explore mode — {len(discovered_tools)} tools discovered")
+
+        if active_skill_content:
+            # Skill is active: strictly filter down to ONLY the tools defined in the skill!
+            discovered_tools = _filter_tools_by_skill(all_live_tools, active_skill_content, c_id)
+            logger.info(f"[MCP AGENT] {c_id}: 📌 Skill active ('{selected_skill}') — strictly filtered to {len(discovered_tools)} tools: {[t['name'] for t in discovered_tools]}")
+        else:
+            # No skill: Explore mode — freeform discovery
+            discovered_tools = all_live_tools
+            logger.info(f"[MCP AGENT] {c_id}: 🔍 Explore mode (no skill) — {len(discovered_tools)} tools discovered")
     # ──────────────────────────────────────────────────────────────────────────────────────────
 
     if not discovered_tools:
         return WorkerResult(connector=c_id, ok=False, error=f"No accessible tools discovered on {c_id.capitalize()}.")
 
-    # Prune tools to safe budget (guarantees <= 50 tools, well under OpenAI's 128 tool cap)
-    active_tools = _prune_tools_for_query(discovered_tools, user_query, connector_id=c_id, max_tools=50)
+    # If skill is active, preserve all skill tools; otherwise prune explore tools
+    if active_skill_content:
+        active_tools = discovered_tools
+    else:
+        active_tools = _prune_tools_for_query(discovered_tools, user_query, connector_id=c_id, max_tools=50)
+
     discovery_tools, _action_tools = _classify_tools(active_tools)
 
     tool_map: Dict[str, str] = {}
@@ -589,7 +674,7 @@ async def _run_worker_loop(
                     "data": {
                         "type": "array",
                         "items": {"type": "object"},
-                        "description": "Array of structured items (issues, errors, deployments, tasks, records) retrieved.",
+                        "description": "Array of structured items (issues, errors, deployments, tasks, records) retrieved or created.",
                     },
                     "resolved_context": {
                         "type": "object",
@@ -597,7 +682,7 @@ async def _run_worker_loop(
                     },
                     "summary": {
                         "type": "string",
-                        "description": "Concise, factual markdown summary of findings for this app.",
+                        "description": "Concise, factual markdown summary of findings or actions performed for this app.",
                     },
                 },
                 "required": ["data"],
@@ -689,26 +774,40 @@ async def _run_worker_loop(
             f"\n\n=== AUTHORITATIVE PROCEDURAL SKILL MANUAL: {skill_name_display} ===\n"
             f"{active_skill_content.strip()}\n"
             f"=========================================================================\n"
-            f"INSTRUCTION: You MUST adhere to the Step-by-Step Workflow and Anti-Hallucination rules defined in the Skill Manual above.\n"
+            f"INSTRUCTION: You MUST adhere strictly to the Step-by-Step Tool Execution Workflow and Anti-Hallucination rules defined in the Skill Manual above.\n"
         )
 
-    system_prompt = (
-        f"You are the dedicated {c_id.capitalize()} Sub-Agent for WEKRAFT.\n"
-        f"Task: Retrieve live third-party data to satisfy the user query: '{user_query}'.\n"
-        f"{workspace_context_hint}\n"
-        f"{github_scope_instruction}"
-        f"{jira_scope_instruction}"
-        f"{skill_injection}"
-        f"Tools with no required parameters are Discovery Tools: {discovery_names}.\n"
-        f"Rules:\n"
-        f"1. You MUST call retrieval tool(s) to fetch real workspace data. Do not provide a speculative text answer.\n"
-        f"2. If an action tool requires an ID, slug, cloudId, channel, or resource key you do not have, "
-        f"call a Discovery Tool first to discover it — NEVER guess or fabricate an ID.\n"
-        f"3. When fetching lists of items, use reasonable general filters (e.g. limit: 20 or recent items) "
-        f"so valid data is not filtered out by local display name mismatches.\n"
-        f"4. If a call returns 404 or missing parameter, inspect the error, call a discovery tool if needed, and retry.\n"
-        f"5. End your turn by calling `{FINALIZE_TOOL}` with the structured results ('data'), resolved context, and a clear markdown summary."
-    )
+    if active_skill_content:
+        system_prompt = (
+            f"You are the dedicated {c_id.capitalize()} Sub-Agent executing a procedural skill workflow for WEKRAFT.\n"
+            f"Target Task: {user_query}\n"
+            f"{workspace_context_hint}\n"
+            f"{github_scope_instruction}"
+            f"{jira_scope_instruction}"
+            f"{skill_injection}\n"
+            f"CRITICAL EXECUTION RULES:\n"
+            f"1. You are operating in STRICT SKILL EXECUTION MODE. Follow the exact step-by-step instructions in the Skill Manual above.\n"
+            f"2. You are equipped ONLY with the exact tools needed for this skill: {[t['name'] for t in active_tools]}.\n"
+            f"3. If the skill calls for creating or mutating resources (e.g. creating pages, issues, updating records), YOU MUST EXECUTE the corresponding creation/update tool. Do NOT skip tool calls or guess results.\n"
+            f"4. Once the skill steps are completed, call `{FINALIZE_TOOL}` with the structured output, URLs/IDs generated, and markdown summary."
+        )
+    else:
+        system_prompt = (
+            f"You are the dedicated {c_id.capitalize()} Sub-Agent for WEKRAFT.\n"
+            f"Task: Retrieve live third-party data to satisfy the user query: '{user_query}'.\n"
+            f"{workspace_context_hint}\n"
+            f"{github_scope_instruction}"
+            f"{jira_scope_instruction}"
+            f"Tools with no required parameters are Discovery Tools: {discovery_names}.\n"
+            f"Rules:\n"
+            f"1. You MUST call retrieval tool(s) to fetch real workspace data. Do not provide a speculative text answer.\n"
+            f"2. If an action tool requires an ID, slug, cloudId, channel, or resource key you do not have, "
+            f"call a Discovery Tool first to discover it — NEVER guess or fabricate an ID.\n"
+            f"3. When fetching lists of items, use reasonable general filters (e.g. limit: 20 or recent items) "
+            f"so valid data is not filtered out by local display name mismatches.\n"
+            f"4. If a call returns 404 or missing parameter, inspect the error, call a discovery tool if needed, and retry.\n"
+            f"5. End your turn by calling `{FINALIZE_TOOL}` with the structured results ('data'), resolved context, and a clear markdown summary."
+        )
 
     messages: List[Any] = [
         SystemMessage(content=system_prompt),
@@ -782,14 +881,64 @@ async def _run_worker_loop(
         if final_payload is not None:
             break
 
-    # Helper to extract Notion URL if Notion created a page
+    # Helper to extract Notion URL & ID if Notion created a page
     import re
+    import json
     notion_url_match = None
+    notion_page_id = None
     if c_id == "notion":
-        all_raw = "\n".join(collected_tool_texts) + " " + last_text_response
-        found_urls = re.findall(r'https?://(?:www\.)?notion\.(?:so|com)/[^\s"\'\]\)]+', all_raw)
-        if found_urls:
-            notion_url_match = found_urls[0]
+        all_raw = "\n".join(collected_tool_texts) + " " + (last_text_response or "")
+
+        # 1. Parse from JSON in tool execution outputs
+        for text in collected_tool_texts:
+            try:
+                json_part = text
+                if "]: " in text:
+                    json_part = text.split("]: ", 1)[1]
+
+                parsed = None
+                try:
+                    parsed = json.loads(json_part)
+                except Exception:
+                    pass
+
+                if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict) and "text" in parsed[0]:
+                    try:
+                        parsed = json.loads(parsed[0]["text"])
+                    except Exception:
+                        pass
+
+                if isinstance(parsed, dict):
+                    pages = parsed.get("pages", [])
+                    if pages and isinstance(pages, list) and isinstance(pages[0], dict):
+                        if pages[0].get("url"):
+                            notion_url_match = pages[0]["url"]
+                        if pages[0].get("id"):
+                            notion_page_id = pages[0]["id"]
+            except Exception:
+                pass
+
+        # 2. Regex fallback
+        if not notion_url_match:
+            found_urls = re.findall(r'https?://(?:www\.)?notion\.(?:so|com)/[a-zA-Z0-9_\-]+', all_raw)
+            if found_urls:
+                notion_url_match = found_urls[0]
+
+    # Helper function to sanitize summary and guarantee clean Notion markdown output
+    def _sanitize_summary(raw_summary: str) -> str:
+        s = raw_summary.strip()
+        is_raw_json = s.startswith("{") and ("creation_mode" in s or "allow_async" in s or "pages" in s)
+        if is_raw_json or (c_id == "notion" and "notion-create-pages" in tools_executed):
+            link_md = f"[Open Notion Document]({notion_url_match})" if notion_url_match else "Notion Document"
+            id_md = f"\n- **Page ID:** `{notion_page_id}`" if notion_page_id else ""
+            return (
+                f"✅ **Notion Page Created Successfully!**\n"
+                f"- **Page Link:** {link_md}{id_md}\n"
+                f"- **Status:** Published to Notion workspace.\n"
+            )
+        if notion_url_match and notion_url_match not in s:
+            return f"✅ **Notion Page Created Successfully!**\n- **Page Link:** [Open Notion Document]({notion_url_match})\n\n" + s
+        return s
 
     # Extract structured results
     if final_payload is not None:
@@ -797,9 +946,7 @@ async def _run_worker_loop(
         data = final_payload.get("data", []) or []
         if not isinstance(data, list):
             data = [data]
-        summary = final_payload.get("summary") or last_text_response
-        if notion_url_match and (not summary or notion_url_match not in summary):
-            summary = f"✅ **Notion Page Created Successfully!**\n- **Page Link:** [Open Notion Document]({notion_url_match})\n\n" + (summary or "")
+        summary = _sanitize_summary(final_payload.get("summary") or last_text_response)
 
         return WorkerResult(
             connector=c_id.capitalize(),
@@ -812,9 +959,7 @@ async def _run_worker_loop(
 
     # Fallback if finalize_result was not explicitly invoked
     if tools_executed:
-        fallback_summary = last_text_response if last_text_response else "\n".join(collected_tool_texts)
-        if notion_url_match and notion_url_match not in fallback_summary:
-            fallback_summary = f"✅ **Notion Page Created Successfully!**\n- **Page Link:** [Open Notion Document]({notion_url_match})\n\n" + fallback_summary
+        fallback_summary = _sanitize_summary(last_text_response if last_text_response else "\n".join(collected_tool_texts))
 
         return WorkerResult(
             connector=c_id.capitalize(),
@@ -876,7 +1021,20 @@ async def execute_mcp_agent_workflow(
             "failures": [],
         }
 
-    target_connections = smart_prune_connectors(user_query, active_connections)
+    target_connections = smart_prune_connectors(
+        user_query,
+        active_connections,
+        active_skill_content=active_skill_content,
+        selected_skill=selected_skill,
+    )
+    if not target_connections:
+        return {
+            "summary": "ℹ️ No third-party MCP integrations targeted for this request.",
+            "structured_data": {},
+            "connected_apps": [],
+            "executed_tools": [],
+            "failures": [],
+        }
     connected_app_names = [c.get("connectorId", "unknown").capitalize() for c in target_connections]
 
     mcp_model = os.getenv("MCP_AGENT_MODEL", "gpt-4.1-mini")
@@ -891,42 +1049,64 @@ async def execute_mcp_agent_workflow(
 
     t0 = time.monotonic()
 
-    # Two-Phase Coordination: If both source apps (Sentry, GitHub) and a sink app (Notion)
-    # are targeted, run sources in Phase 1 first so the sink (Phase 2) receives the retrieved data.
+    # Two-Phase Coordination: If a destination/sink app (Notion) is targeted,
+    # gather data from source apps or workspace DB first, then pass full context to sink.
     sink_connectors = {"notion"}
     source_conns = [c for c in target_connections if c.get("connectorId", "").lower() not in sink_connectors]
     sink_conns = [c for c in target_connections if c.get("connectorId", "").lower() in sink_connectors]
 
     results: List[WorkerResult] = []
 
-    if source_conns and sink_conns:
-        # Phase 1: Run source sub-workers in parallel
-        source_tasks = [
-            _execute_single_app_worker(
-                conn=conn,
-                user_query=user_query,
-                llm=llm,
-                timeout_s=per_app_timeout_s,
-                active_skill_content=active_skill_content,
-                selected_skill=selected_skill,
-            )
-            for conn in source_conns
-        ]
-        source_results: List[WorkerResult] = await asyncio.gather(*source_tasks, return_exceptions=False)
-        results.extend(source_results)
+    if sink_conns:
+        # Phase 1: Run any third-party source workers in parallel
+        source_results: List[WorkerResult] = []
+        if source_conns:
+            source_tasks = [
+                _execute_single_app_worker(
+                    conn=conn,
+                    user_query=user_query,
+                    llm=llm,
+                    timeout_s=per_app_timeout_s,
+                    active_skill_content=active_skill_content,
+                    selected_skill=selected_skill,
+                )
+                for conn in source_conns
+            ]
+            source_results = await asyncio.gather(*source_tasks, return_exceptions=False)
+            results.extend(source_results)
 
-        # Build concise source findings block for the sink worker
+        # Gather internal workspace DB context (tasks, issues, workloads, project health)
         source_context_lines = []
-
-        if project_id and any(k in (user_query + (active_skill_content or "")).lower() for k in ["project task", "project tasks", "mine project", "internal task", "internal tasks", "project_tasks"]):
+        q_lower = (user_query + (active_skill_content or "")).lower()
+        if project_id and any(k in q_lower for k in ["task", "issue", "workload", "health", "duration", "timeline", "project", "member", "internal", "wekraft"]):
             try:
-                from app.agents.tools.tools import fetch_tasks_summary_async
-                proj_tasks = await fetch_tasks_summary_async(project_id)
-                if proj_tasks and not proj_tasks.get("error"):
-                    raw_summary = proj_tasks.get("summary") or str(proj_tasks)
-                    source_context_lines.append(f"### Internal Project Tasks (From Workspace DB):\n{raw_summary}")
+                from app.agents.tools.tools import (
+                    fetch_tasks_summary_async,
+                    fetch_issues_summary_async,
+                    fetch_member_workload_async,
+                    fetch_project_insights_async,
+                )
+                tasks_f = fetch_tasks_summary_async(project_id)
+                issues_f = fetch_issues_summary_async(project_id)
+                workload_f = fetch_member_workload_async(project_id)
+                insights_f = fetch_project_insights_async(project_id)
+                t_res, i_res, w_res, ins_res = await asyncio.gather(tasks_f, issues_f, workload_f, insights_f, return_exceptions=True)
+
+                if isinstance(t_res, dict) and not t_res.get("error"):
+                    source_context_lines.append(f"### Internal Project Tasks:\n{t_res.get('summary') or str(t_res)}")
+                if isinstance(i_res, dict) and not i_res.get("error"):
+                    source_context_lines.append(f"### Internal Project Issues:\n{i_res.get('summary') or str(i_res)}")
+                if isinstance(w_res, dict) and not w_res.get("error"):
+                    members = w_res.get("members", [])
+                    if members:
+                        source_context_lines.append("### Team Member Workload:\n" + "\n".join(
+                            f"- {m.get('name', 'Member')}: {m.get('activeTasksCount', 0)} active tasks, {m.get('totalLoggedHours', 0)} hrs logged"
+                            for m in members
+                        ))
+                if isinstance(ins_res, dict) and not ins_res.get("error"):
+                    source_context_lines.append(f"### Project Overview & Health:\n{ins_res.get('summary') or str(ins_res)}")
             except Exception as e:
-                logger.warning(f"Could not load internal project tasks for sink: {e}")
+                logger.warning(f"Could not load internal project data for sink: {e}")
 
         for sr in source_results:
             if sr.ok and sr.summary:
@@ -934,15 +1114,15 @@ async def execute_mcp_agent_workflow(
             elif sr.ok and sr.data:
                 source_context_lines.append(f"### {sr.connector} Data ({len(sr.data)} items):\n" + "\n".join(str(d) for d in sr.data[:15]))
 
-        aggregated_findings = "\n\n".join(source_context_lines) if source_context_lines else "No source items found."
+        aggregated_findings = "\n\n".join(source_context_lines) if source_context_lines else "No additional source items found."
         sink_query = (
             f"{user_query}\n\n"
             f"[RETRIEVED WORKSPACE DATA FROM SOURCES & DB]:\n"
             f"{aggregated_findings}\n\n"
-            f"INSTRUCTION: Create the requested Notion page incorporating the above retrieved data into organized markdown tables, including actionable insights and recommended actions."
+            f"INSTRUCTION: Execute the active procedural skill to create/update the requested Notion document with the above retrieved data into organized markdown tables, including actionable insights and executive summary."
         )
 
-        # Phase 2: Run sink sub-worker with the gathered data
+        # Phase 2: Run sink sub-worker with gathered data
         sink_tasks = [
             _execute_single_app_worker(
                 conn=conn,

@@ -186,12 +186,18 @@ async def route_user_request(
                     decision.actions.remove("direct_response")
 
         # Third-party overrides
-        mcp_keywords = ["jira", "linear", "slack", "calendly", "notion", "hubspot", "sentry", "vercel", "github", "pr", "prs", "pull request", "repo", "repository", "codebase", "branch", "commit"]
-        if any(k in lower_latest for k in mcp_keywords):
+        mcp_keywords = ["jira", "linear", "slack", "calendly", "notion", "hubspot", "sentry", "vercel", "github", "pr", "prs", "pull request", "repo", "repository", "codebase", "branch", "commit", "mcp", "integration", "integrations"]
+        has_mcp_kw = any(k in lower_latest for k in mcp_keywords)
+        if has_mcp_kw:
             if "mcp" not in decision.actions:
                 if "direct_response" in decision.actions:
                     decision.actions.remove("direct_response")
                 decision.actions.append("mcp")
+        elif "mcp" in decision.actions and not decision.selected_skill:
+            # If no 3rd party keyword and no skill, remove spurious MCP call
+            decision.actions.remove("mcp")
+            if not decision.actions:
+                decision.actions = ["analyst"] if any(k in lower_latest for k in ["task", "tasks", "issue", "issues", "workload", "standup", "health", "project"]) else ["direct_response"]
 
         # Sprint overrides
         sprint_keywords = ["sprint", "sprints", "velocity", "backlog", "burndown"]
@@ -473,18 +479,19 @@ async def analyst_worker_node(state: SupervisorState, config: RunnableConfig) ->
                 total = tasks_data.get("totalCount", tasks_data.get("total", 0))
                 completed = tasks_data.get("completedCount", 0)
                 blocked = tasks_data.get("blockedCount", 0)
-                active_tasks = tasks_data.get("criticalAndActiveTasks", [])
-                in_prog = sum(1 for t in active_tasks if "prog" in str(t.get("status", "")).lower())
-                todo = sum(1 for t in active_tasks if "start" in str(t.get("status", "")).lower() or "todo" in str(t.get("status", "")).lower())
-                lines.append(f"- **Tasks Breakdown**: Total Tasks: {total} | In Progress: {in_prog} | To-Do: {todo} | Completed: {completed} | Blocked: {blocked}")
+                active_tasks = tasks_data.get("tasks") or tasks_data.get("criticalAndActiveTasks") or []
+                lines.append(f"- **Tasks Breakdown**: Total Tasks: {total} | Completed: {completed} | Blocked: {blocked}")
                 if active_tasks:
                     lines.append("  **Active Tasks List**:")
                     for t in active_tasks:
-                        title = t.get("title", "Untitled")
-                        status = t.get("status", "unknown")
-                        prio = t.get("priority", "normal")
-                        assignees = ", ".join(t.get("assignees", [])) or "Unassigned"
-                        lines.append(f"  • '{title}' | Status: {status} | Priority: {prio} | Assignee: {assignees}")
+                        if isinstance(t, str):
+                            lines.append(f"  • {t}")
+                        elif isinstance(t, dict):
+                            title = t.get("title", "Untitled")
+                            prio = t.get("priority", "medium")
+                            assignee = t.get("assignee") or (", ".join(t.get("assignees", [])) if isinstance(t.get("assignees"), list) else "Unassigned")
+                            deadline_status = t.get("deadlineStatus", "on track")
+                            lines.append(f"  • Task Title: '{title}' | Assignee: {assignee} | Priority: {prio} | Deadline: {deadline_status}")
 
         # Issues Section (only if issues were requested)
         if issues_data is not None:
@@ -501,7 +508,8 @@ async def analyst_worker_node(state: SupervisorState, config: RunnableConfig) ->
                         title = iss.get("title", "Untitled")
                         sev = iss.get("severity", "medium")
                         status = iss.get("status", "opened")
-                        lines.append(f"  • '{title}' | Severity: {sev} | Status: {status}")
+                        assignees = ", ".join(iss.get("assignees", [])) if isinstance(iss.get("assignees"), list) else "Unassigned"
+                        lines.append(f"  • Issue Title: '{title}' | Severity: {sev} | Status: {status} | Assignee: {assignees}")
 
         # Project Timeline Section (only if requested)
         if project_data is not None and "error" not in project_data and project_data:
@@ -1175,12 +1183,13 @@ YOUR PERSONA & STANDARDS:
 2. Temporal Grounding & Proximity: Today is {current_date}. The target deadline is {deadline_text}. Use these real-world temporal anchors to evaluate timeline urgency, overdue risks, and sprint momentum without hallucinating dates.
 3. Strict Privacy & Zero Raw Database IDs: NEVER output, mention, or leak internal Convex database IDs (such as 'kn71qtgem...' or 'nd7088...'). Use only the real project name ('{project_name}'), user name ('{user_name}'), and actual task/issue/ticket titles.
 4. MANDATORY STRUCTURED MARKDOWN TABLES FOR INTEGRATIONS, ISSUES, TASKS & SPRINTS:
-   - CLEAR ITEM COUNTS: Always start each integration or data section with a prominent header indicating the total item count (e.g. `### 🚨 Sentry Issues (Total: 20 Unresolved)` or `### 🚀 Vercel Deployments (Total: 3)` or `### 📋 Jira Tasks (Total: 4)`).
+   - CLEAR ITEM COUNTS: Always start each integration or data section with a prominent header indicating the total item count (e.g. `### 🚨 Sentry Issues (Total: 20 Unresolved)` or `### 🚀 Vercel Deployments (Total: 3)` or `### 📋 Internal Tasks (Total: 3)` or `### 🐛 Internal Issues (Total: 2)`).
    - COMPREHENSIVE MARKDOWN TABLES: You MUST render ALL retrieved items in clean, formatted Markdown Tables with all relevant details:
      * Sentry: `| ID / Short Key | Issue / Error Title | Culprit / Location | Status | Level / Severity | Events | Users | Link |`
      * Jira / Linear: `| Key | Issue / Task Summary | Status | Priority | Assignee | Link |`
      * Vercel: `| Project | Deployment URL | State / Status | Commit / Branch | Target / Environment | Creator | Link |`
-     * Internal Tasks / Issues: `| Task / Issue Title | Status | Priority / Severity | Assignee | Deadline / Environment |`
+     * Internal Project Tasks: `| Task Title | Assignee | Priority | Deadline / Status |`
+     * Internal Project Issues: `| Issue Title | Severity | Status | Assignees |`
    - CLICKABLE LINKS: If URLs, permalinks, inspector URLs, or deployment links are available in the worker data, you MUST include clickable Markdown links (e.g. `[View on Sentry](https://...)` or `[Open Deployment](https://...)`) in the Link column.
    - DO NOT COLLAPSE OR TRUNCATE: List every single issue/item in its own table row. Never use placeholder lines like '| ... and 15 more |'.
    - EXECUTIVE SUMMARY AT END: At the very end of your response, provide an authoritative '### 📊 Executive PM Summary & Next Actions' section containing:
@@ -1192,7 +1201,9 @@ YOUR PERSONA & STANDARDS:
 7. NOTION / EXTERNAL DOC CREATION CONFIRMATION & DIRECT LINK:
    If the SUB-AGENT WORKER DATA indicates that a Notion page was created or includes a Notion URL:
    - You MUST prominently display the confirmation and the direct clickable link at the VERY TOP of your response:
-     `### 📄 Created Notion/other Doc Page: [Open Notion Document](<url>)`
+     `### 📄 Created Notion Doc Page: [Open Notion Document](<url>)`
+   - Summarize the contents that were placed into the Notion document in clean, readable Markdown (including a breakdown of tasks and notes included).
+   - NEVER output raw JSON request payloads or parameters in your chat response. Always format as professional Markdown.
 
 SUB-AGENT WORKER DATA:
 {findings_prompt}

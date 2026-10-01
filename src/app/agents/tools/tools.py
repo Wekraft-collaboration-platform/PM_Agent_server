@@ -599,7 +599,84 @@ This skill coordinates internal project tasks and external Jira Kanban/Scrum tas
 }
 ```""",
     },
+    {
+        "name": "notion_page_operations",
+        "title": "Notion — Create, Update & Fetch Pages",
+        "connectorId": "notion",
+        "description": "Exact MCP tool names, payloads, and response parsing to create a Notion page, insert content into it, and fetch its full content.",
+        "content": """---
+name: notion_page_operations
+title: Notion — Create, Update & Fetch Pages
+connectorId: notion
+version: 1.0.0
+---
+
+# Notion Page Operations
+
+> ⚠ All Notion MCP responses wrap data as a JSON string inside `result.content`. Always parse `result["content"]` as JSON before reading any field.
+
+---
+
+## Step 1 — Create a Page
+Tool: `notion-create-pages`
+```json
+{
+  "creation_mode": "draft",
+  "allow_async": false,
+  "pages": [{
+    "properties": { "title": "<Page Title>" },
+    "content": "<Markdown body>",
+    "icon": "📋"
+  }]
+}
+```
+Extract ID from response:
+```python
+inner = json.loads(result["content"])
+page_id = inner["pages"][0]["id"]
+page_url = inner["pages"][0]["url"]
+```
+
+---
+
+## Step 2 — Insert Content into a Page
+Tool: `notion-update-page`
+```json
+{
+  "page_id": "<pageId>",
+  "command": "insert_content",
+  "content": "<Markdown to append>"
+}
+```
+> ⚠ Field is `page_id` — NOT `id`. Wrong key causes validation error.
+> command options: `insert_content` | `replace_content` | `update_properties`
+
+Success: `result["isError"] == false`
+
+---
+
+## Step 3 — Fetch Page Content
+Tool: `notion-fetch`
+```json
+{ "id": "<pageId or full https://app.notion.com/p/<id> URL>" }
+```
+Read body:
+```python
+inner = json.loads(result["content"])
+body = inner["text"]  # full page content
+```
+
+---
+
+## Finalization
+Call `finalize_result` with `{ pageId, pageUrl }` from Step 1 and a one-line summary.
+
+## Rules
+- Never claim page was created until `notion-create-pages` returns `isError: false`.
+- Never fabricate URLs — always use the `url` from the create response.""",
+    },
 ]
+
 
 
 async def fetch_active_skills_async(user_id: str = "") -> List[Dict[str, Any]]:
