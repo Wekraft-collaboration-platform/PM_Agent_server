@@ -28,7 +28,7 @@ from app.agents.tools.tools import convex_post_async
 load_dotenv()
 logger = logging.getLogger("mcp_orchestrator")
 
-DEFAULT_STEP_BUDGET = 3
+DEFAULT_STEP_BUDGET = 5  # Raised from 3 — gives sub-agents enough room for discovery + action + finalize
 DEFAULT_WORKER_TIMEOUT_S = 45.0
 FINALIZE_TOOL = "finalize_result"
 
@@ -392,7 +392,12 @@ def smart_prune_connectors(
         return matched
 
     # Explicit general MCP / integrations keywords check
-    general_mcp_keywords = ["mcp", "integrations", "connected apps", "all apps", "external tools", "all tools", "third-party", "external integrations"]
+    general_mcp_keywords = [
+        "mcp", "integrations", "connected apps", "all apps", "external tools", "all tools", "third-party", "external integrations",
+        # Cross-app discovery queries: user is comparing workspace tasks with external tools
+        "compare", "bring", "import", "sync", "which tasks", "what tasks", "not completed", "incomplete", "missing from",
+        "cross-check", "same as", "duplicate", "overlap", "suggest", "transfer", "migrate",
+    ]
     if any(k in user_query.lower() for k in general_mcp_keywords):
         return active_connections
 
@@ -873,8 +878,9 @@ async def _run_worker_loop(
             collected_tool_texts.append(f"[{raw_tool_name}]: {content_str}")
 
             # Truncate keeping head and tail to preserve essential IDs/cursors
-            if len(content_str) > 2500:
-                content_str = content_str[:1800] + "\n...[truncated]...\n" + content_str[-700:]
+            # Raised limit: 5000 chars so LLM has richer context for cross-app discovery
+            if len(content_str) > 5000:
+                content_str = content_str[:3500] + "\n...[truncated]...\n" + content_str[-1500:]
 
             messages.append(ToolMessage(content=content_str, tool_call_id=call_id))
 
