@@ -6,6 +6,21 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def infer_task_tag(title: str) -> dict:
+    t = title.lower()
+    if any(k in t for k in ["pay", "bill", "invoice", "finance", "money", "subscription"]):
+        return {"label": "Payment", "color": "green"}
+    if any(k in t for k in ["auth", "login", "jwt", "user", "signup", "security", "iam"]):
+        return {"label": "Auth", "color": "blue"}
+    if any(k in t for k in ["ui", "frontend", "layout", "css", "page", "client", "meet", "design"]):
+        return {"label": "UI", "color": "purple"}
+    if any(k in t for k in ["middleware", "api", "route", "backend", "database", "sql", "endpoint", "server"]):
+        return {"label": "API", "color": "yellow"}
+    if any(k in t for k in ["bug", "fix", "error", "patch"]):
+        return {"label": "Bugfix", "color": "grey"}
+    return {"label": "Feature", "color": "blue"}
+
+
 class LlamaCloudExtractor:
     """
     LlamaCloud Document Parser & Structured Task/Issue Extractor.
@@ -55,11 +70,12 @@ class LlamaCloudExtractor:
                     "severity": "critical" if "critical" in lowered or "urgent" in lowered else "medium",
                 })
             elif "task" in lowered or "todo" in lowered or "feature" in lowered or "implement" in lowered:
+                clean_title = line.lstrip("-*#1234567890. ").strip()
                 tasks.append({
-                    "title": line.lstrip("-*#1234567890. ").strip(),
+                    "title": clean_title,
                     "description": lines[i+1] if i + 1 < len(lines) else "Extracted from uploaded PRD",
                     "priority": "high" if "high" in lowered or "urgent" in lowered else "medium",
-                    "type": {"label": "PRD-Import", "color": "#3b82f6"},
+                    "type": infer_task_tag(clean_title),
                 })
 
         return {"tasks": tasks, "issues": issues}

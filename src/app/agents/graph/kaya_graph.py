@@ -107,9 +107,11 @@ CRITICAL RULES:
 4. MINIMAL SUB-AGENT CALLS:
    - NEVER call extra sub-agents if not asked by the user. Route ONLY to the exact sub-agents necessary to fulfill the user's request.
 
-5. SELECTING AT MOST 1 PROCEDURAL SKILL:
+5. PROCEDURAL SKILL SELECTION RULES:
    - Evaluate the Available Skills Catalog (Level 1 Metadata).
-   - If the task matches a specialized workflow, choose ONLY the SINGLE purest matching skill.
+   - CRITICAL MATCHING RULE: NEVER select a skill whose connector list or description requires a third-party service (e.g. Notion, Slack, Linear, Sentry) that the user DID NOT explicitly ask for in their prompt.
+   - For example: If the user asks for Jira tasks, select ONLY 'jira_issue_management'. Do NOT select 'jira_project_tasks_alignment_notion_sync' unless Notion is explicitly requested.
+   - Choose the purest atomic skill that matches the exact connectors requested by the user.
    - If no specialized skill applies (e.g. casual conversation or generic query), set selected_skill to null.
 
 Available Sub-Agents:
@@ -122,6 +124,67 @@ Available Sub-Agents:
 Available Skills Catalog (Level 1 Metadata):
 {SKILLS_CATALOG_BLOCK}
 """
+
+
+def resolve_skill_selection(
+    text: str,
+    active_skills: List[Dict[str, Any]],
+    selected_skill: Optional[str] = None,
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Resolves the best matching skill name and content.
+    1. Verifies if selected_skill exists in active_skills.
+    2. If missing, null, or mismatched, falls back to scoring active_skills against connector/tool keywords
+       (e.g., jira, notion, supabase, sentry, linear, slack, etc.) present in the query.
+       HEAVILY penalizes skills with 3rd-party connectors that the user DID NOT ask for.
+    """
+    # 1. Exact match check
+    if selected_skill:
+        for s in active_skills:
+            if s.get("name") == selected_skill:
+                return selected_skill, s.get("content")
+
+    # 2. Connector / Keyword match fallback
+    lower_text = text.lower()
+    known_apps = ["jira", "linear", "sentry", "notion", "supabase", "slack", "calendly", "hubspot", "vercel", "github"]
+    mentioned_apps = [app for app in known_apps if app in lower_text]
+
+    if not mentioned_apps:
+        return None, None
+
+    best_skill = None
+    best_score = -100
+
+    for s in active_skills:
+        name = (s.get("name") or "").lower()
+        connector = (s.get("connectorId") or s.get("connector") or "").lower()
+        title = (s.get("title") or "").lower()
+        desc = (s.get("description") or "").lower()
+        connectors = [c.strip() for c in connector.split(",") if c.strip()]
+
+        score = 0
+        for app in mentioned_apps:
+            if app in connectors:
+                score += 20
+            elif app in name:
+                score += 15
+            elif app in title or app in desc:
+                score += 5
+
+        # Strict Penalty for extra 3rd-party connectors that user DID NOT ask for
+        # (e.g. if user only asks for Jira, severely penalize composite Jira+Notion skills)
+        for conn in connectors:
+            if conn not in ["project", "internal"] and conn not in mentioned_apps:
+                score -= 30
+
+        if score > best_score and score > 0:
+            best_score = score
+            best_skill = s
+
+    if best_skill:
+        return best_skill.get("name"), best_skill.get("content")
+
+    return None, None
 
 
 async def route_user_request(
@@ -212,13 +275,16 @@ async def route_user_request(
         if len(decision.actions) > 1 and "direct_response" in decision.actions:
             decision.actions.remove("direct_response")
 
-        # Hydrate matched skill content
-        matched_content: Optional[str] = None
-        if decision.selected_skill:
-            for s in active_skills:
-                if s.get("name") == decision.selected_skill:
-                    matched_content = s.get("content")
-                    break
+        # Hydrate or auto-resolve skill selection
+        matched_skill_name, matched_content = resolve_skill_selection(
+            user_input, active_skills, decision.selected_skill
+        )
+        if matched_skill_name:
+            if decision.selected_skill != matched_skill_name:
+                decision.reasoning += f" (Skill '{matched_skill_name}' auto-resolved via connector/keyword match)"
+            decision.selected_skill = matched_skill_name
+        else:
+            decision.selected_skill = None
 
         safe_reasoning = decision.reasoning.encode("ascii", "replace").decode("ascii")
         print(f"\n🎯 [ROUTER DECISION] Actions: {decision.actions} | Selected Skill: {decision.selected_skill or 'None'} | Reasoning: {safe_reasoning}\n")
@@ -244,12 +310,16 @@ async def route_user_request(
         if not actions:
             actions = ["direct_response"]
 
+        fallback_skill_name, fallback_content = resolve_skill_selection(
+            user_input, active_skills, None
+        )
+
         fallback_decision = SupervisorDecision(
             actions=actions,
-            selected_skill=None,
+            selected_skill=fallback_skill_name,
             reasoning=f"Fallback routing: {safe_err}",
         )
-        return fallback_decision, None
+        return fallback_decision, fallback_content
 
 
 
@@ -598,10 +668,31 @@ async def analyst_worker_node(state: SupervisorState, config: RunnableConfig) ->
 # SUB-AGENT 2: DB WRITE WORKER (Mem0 & HITL Write Schema Tools)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _get_tag_color(tag_label: str) -> str:
+    """Map a tag label to one of the theme badge colors: green, yellow, purple, blue, grey."""
+    tl = (tag_label or "").lower().strip()
+    if any(k in tl for k in ["pay", "bill", "money", "financ", "subscri", "pricing"]):
+        return "green"
+    elif any(k in tl for k in ["middle", "api", "back", "rout", "serv", "data", "db", "sql", "endpoint"]):
+        return "yellow"
+    elif any(k in tl for k in ["ui", "front", "design", "client", "meet", "ux", "mobile", "view", "page"]):
+        return "purple"
+    elif any(k in tl for k in ["bug", "fix", "issue", "err", "test", "doc", "audit", "patch"]):
+        return "grey"
+    elif any(k in tl for k in ["auth", "sec", "iam", "devops", "cloud", "infra", "setup", "config"]):
+        return "blue"
+    colors = ["blue", "purple", "green", "yellow", "grey"]
+    return colors[sum(ord(c) for c in tl) % len(colors)]
+
+
 class TaskDraftItem(BaseModel):
     title: str = Field(description="Clean, concise title of the task")
     description: Optional[str] = Field(default="", description="Detailed description or context")
     priority: Optional[str] = Field(default="medium", description="Priority level: 'high', 'medium', or 'low'")
+    tag: Optional[str] = Field(
+        default="Feature",
+        description="A short, concise 1-2 word domain tag describing the task category (e.g. 'Payment', 'Auth', 'Middleware', 'UI', 'Backend', 'DevOps', 'Client', 'Setup', 'Bugfix', 'API', 'Billing', 'Testing'). Keep it very short. NEVER use 'PRD-Import'."
+    )
 
 
 class IssueDraftItem(BaseModel):
@@ -694,13 +785,14 @@ async def db_write_worker_node(state: SupervisorState, config: RunnableConfig) -
                         "   - If the user asks to create tasks, add tasks, make tasks, or says 'create tasks of those please !', 'create these tasks', 'create those', 'yes create', 'yes confirm', or 'extract tasks':\n"
                         "     * ALWAYS set is_task_creation=True.\n"
                         "     * Extract all actionable tasks from the attached PRD (if provided) OR from the Assistant's previous messages/tables in conversation history into the `tasks` list.\n"
-                        "     * Populate each task with a clean, concise title, contextual description, and priority ('high', 'medium', 'low').\n"
+                        "     * Populate each task with a clean, concise title, contextual description, priority ('high', 'medium', 'low'), and a short 1-2 word domain tag in `tag`.\n"
                         "2. ISSUE CREATION TRIGGER:\n"
                         "   - If the user asks to create issues, log bugs, or says 'create issues of those', 'create issues for these blockers':\n"
                         "     * ALWAYS set is_issue_creation=True.\n"
                         "     * Extract all bugs/issues from the document or previous messages into `issues` with title, description, and severity ('critical', 'high', 'medium', 'low').\n"
-                        "3. TITLES & DESCRIPTIONS:\n"
-                        "   - Keep task titles concise and actionable (e.g. 'Fix dispute-hold release bug', 'Audit and fix IAM segregation-of-duties violations'). Never return an empty task list if items were discussed or exist in the PRD."
+                        "3. TITLES, DESCRIPTIONS & SHORT DYNAMIC TAGS:\n"
+                        "   - Keep task titles concise and actionable (e.g. 'Fix dispute-hold release bug', 'Setup middleware routes'). Never return an empty task list if items were discussed or exist in the PRD.\n"
+                        "   - For each task, ALWAYS generate a specific, short 1-2 word tag in `tag` based on its topic (e.g., 'Payment', 'Auth', 'Middleware', 'UI', 'Backend', 'DevOps', 'Client', 'Setup', 'Bugfix', 'API', 'Billing', 'Testing'). NEVER use 'PRD-Import' or generic placeholders."
                     )),
                     HumanMessage(content=f"Recent Conversation History:\n{convo_context}{doc_context}\n\nLatest User Query: '{user_query}'"),
                 ]
@@ -708,14 +800,38 @@ async def db_write_worker_node(state: SupervisorState, config: RunnableConfig) -
 
                 # ── 1. Handle Task Creation HITL Interrupt ──────────────────
                 if extracted.is_task_creation and extracted.tasks:
-                    task_items_preview = [
-                        {
+                    task_items_preview = []
+                    for t in extracted.tasks:
+                        clean_tag = (t.tag or "").replace("named-", "").strip()
+                        if not clean_tag or clean_tag.lower() in ["prd-import", "prd_import", "prd import"]:
+                            # Infer short tag from title
+                            t_low = t.title.lower()
+                            if any(k in t_low for k in ["pay", "bill", "money", "financ", "subscri"]):
+                                clean_tag = "Payment"
+                            elif any(k in t_low for k in ["auth", "login", "jwt", "user", "signup", "iam"]):
+                                clean_tag = "Auth"
+                            elif any(k in t_low for k in ["middle", "rout"]):
+                                clean_tag = "Middleware"
+                            elif any(k in t_low for k in ["api", "back", "database", "sql", "server"]):
+                                clean_tag = "API"
+                            elif any(k in t_low for k in ["client", "meet"]):
+                                clean_tag = "Client"
+                            elif any(k in t_low for k in ["ui", "front", "design", "css"]):
+                                clean_tag = "UI"
+                            elif any(k in t_low for k in ["bug", "fix", "error"]):
+                                clean_tag = "Bugfix"
+                            elif any(k in t_low for k in ["setup", "config", "install"]):
+                                clean_tag = "Setup"
+                            else:
+                                clean_tag = "Feature"
+
+                        task_items_preview.append({
                             "title": t.title.replace("named-", "").strip(),
                             "description": t.description if (t.description and not t.description.startswith("Task requested")) else "",
                             "priority": t.priority if t.priority in ["high", "medium", "low"] else "medium",
-                        }
-                        for t in extracted.tasks
-                    ]
+                            "tag": clean_tag,
+                        })
+
                     tool_name = "bulk_create_tasks" if len(task_items_preview) > 1 else "create_task"
                     interrupt_payload = {
                         "tool": tool_name,
@@ -747,14 +863,40 @@ async def db_write_worker_node(state: SupervisorState, config: RunnableConfig) -
                     else:
                         edits = resume_response.get("edits") if isinstance(resume_response, dict) else None
                         final_tasks = edits if isinstance(edits, list) and edits else task_items_preview
-                        tasks_for_convex = [
-                            {
+                        tasks_for_convex = []
+                        for t in final_tasks:
+                            raw_tag = t.get("tag") or (t.get("type", {}).get("label") if isinstance(t.get("type"), dict) else None) or ""
+                            tag_label = str(raw_tag).replace("named-", "").strip()
+                            if not tag_label or tag_label.lower() in ["prd-import", "prd_import", "prd import"]:
+                                t_low = str(t.get("title", "")).lower()
+                                if any(k in t_low for k in ["pay", "bill", "money", "financ", "subscri"]):
+                                    tag_label = "Payment"
+                                elif any(k in t_low for k in ["auth", "login", "jwt", "user", "signup", "iam"]):
+                                    tag_label = "Auth"
+                                elif any(k in t_low for k in ["middle", "rout"]):
+                                    tag_label = "Middleware"
+                                elif any(k in t_low for k in ["api", "back", "database", "sql", "server"]):
+                                    tag_label = "API"
+                                elif any(k in t_low for k in ["client", "meet"]):
+                                    tag_label = "Client"
+                                elif any(k in t_low for k in ["ui", "front", "design", "css"]):
+                                    tag_label = "UI"
+                                elif any(k in t_low for k in ["bug", "fix", "error"]):
+                                    tag_label = "Bugfix"
+                                elif any(k in t_low for k in ["setup", "config", "install"]):
+                                    tag_label = "Setup"
+                                else:
+                                    tag_label = "Feature"
+
+                            tasks_for_convex.append({
                                 "title": t.get("title", "Task").replace("named-", "").strip(),
                                 "description": t.get("description", "") or "",
                                 "priority": t.get("priority", "medium"),
-                            }
-                            for t in final_tasks
-                        ]
+                                "type": {
+                                    "label": tag_label,
+                                    "color": _get_tag_color(tag_label),
+                                },
+                            })
                         write_res = await write_bulk_tasks_to_convex({"projectId": project_id, "tasks": tasks_for_convex})
                         print(f"[HITL WRITE RESULT] Convex bulkInsertTasks response: {write_res}")
                         lines.append(f"- **Task Creation Status**: {write_res} ({len(tasks_for_convex)} task(s) created in project)")

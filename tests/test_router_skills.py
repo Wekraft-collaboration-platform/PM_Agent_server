@@ -14,8 +14,11 @@ from dotenv import load_dotenv
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
 
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_openai import ChatOpenAI
+from app.agents.graph.kaya_graph import resolve_skill_selection
 
 load_dotenv()
 
@@ -41,6 +44,12 @@ SKILLS_CATALOG = [
         "title": "Cross-App Production Incident Escalation",
         "connector": "sentry, linear, project",
         "description": "Coordinates Sentry telemetry, Linear ticketing, and internal project issues to escalate critical production crashes (>10 events) into actionable engineering tickets.",
+    },
+    {
+        "name": "jira_issue_management",
+        "title": "Jira Issue Sync, Search & Safe Ticket Creation",
+        "connector": "jira",
+        "description": "Discovers Atlassian cloudId and resources, searches active or uncompleted Jira issues using universal JQL, and safely creates Jira tasks/issues with project key and verification.",
     },
 ]
 
@@ -150,6 +159,13 @@ async def run_test():
             "expected_actions": ["mcp"],
             "expected_skill": ["incident_escalation_triage", "linear_issue_management"],
         },
+        {
+            "id": 6,
+            "title": "Jira & Internal Workspace Task Comparison",
+            "query": "hey , check my jira tasks , and find what not coimpleted task can be bring tpo this workspace, and chekc my project tasks , they should no be same , sugest me which jira tasks to bring here",
+            "expected_actions": ["mcp", "analyst"],
+            "expected_skill": ["jira_issue_management"],
+        },
     ]
 
     print("=" * 80)
@@ -171,9 +187,14 @@ async def run_test():
         print(f"-> Selected Skill   : {result.selected_skill}")
         print(f"-> Router Reasoning : {result.reasoning}")
 
+        resolved_skill, _ = resolve_skill_selection(tc["query"], SKILLS_CATALOG, result.selected_skill)
+        effective_skill = resolved_skill or result.selected_skill
+        if resolved_skill and resolved_skill != result.selected_skill:
+            print(f"-> Auto-Resolved Skill: {resolved_skill}")
+
         # Check actions match
         actions_ok = all(a in result.actions for a in tc["expected_actions"])
-        skill_ok = result.selected_skill in tc["expected_skill"]
+        skill_ok = (result.selected_skill in tc["expected_skill"]) or (effective_skill in tc["expected_skill"])
 
         print(f"-> Sub-Agents Match : {'[PASS]' if actions_ok else '[FAIL]'}")
         print(f"-> Skill Match      : {'[PASS]' if skill_ok else '[FAIL]'}")

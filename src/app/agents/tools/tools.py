@@ -419,6 +419,119 @@ This skill instructs Kaya and MCP sub-agents on how to interact with Linear: dis
 """,
     },
     {
+        "name": "jira_issue_management",
+        "title": "Jira Issue Sync, Search & Safe Ticket Creation",
+        "connectorId": "jira",
+        "description": "Discovers Atlassian cloudId and resources, searches active or uncompleted Jira issues using universal JQL, and safely creates Jira tasks/issues with project key and verification.",
+        "content": """---
+name: jira_issue_management
+title: Jira Issue Sync, Search & Safe Ticket Creation
+description: Discovers Atlassian cloudId and resources, searches active or uncompleted Jira issues using universal JQL, and safely creates Jira tasks/issues with project key and verification.
+connectorId: jira
+createdBy: default
+version: 1.0.0
+---
+
+# Jira Issue Management Skill
+
+## Context & Objectives
+This skill instructs Kaya and MCP sub-agents on how to interact with Atlassian Jira: dynamically discovering accessible sites and cloud IDs, querying active/uncompleted issues via adaptive JQL, safely creating new tasks or issues, and deduplicating against workspace project tasks.
+
+## Discovery & Prerequisites Protocol
+1. Never guess the Cloud ID: Jira requires a valid Atlassian cloudId. Always run getAccessibleAtlassianResources first to resolve the active cloudId and site URL.
+2. Never assume fixed Project Keys: If the user prompt mentions a project key (e.g. KAN, PROJ), use it. Otherwise, extract the project key from issues returned by JQL search.
+
+## Step-by-Step Tool Execution Workflow
+
+### Step 1 — Resource & Cloud ID Discovery:
+- Tool: getAccessibleAtlassianResources
+- Arguments: {}
+- Capture: cloudId (e.g. e56da97a-1da4-40fd-bed2-4c2663ef28e7) and url from data.resources[0].
+
+### Step 2 — Query / Search Issues (Get Tasks):
+- Tool: searchJiraIssuesUsingJql
+- Default Universal JQL (Find active/uncompleted tasks):
+```json
+{
+  "cloudId": "<discovered_cloudId>",
+  "jql": "statusCategory != Done ORDER BY updated DESC",
+  "maxResults": 20
+}
+```
+*(Note: If statusCategory != Done returns no items or errors, fall back to "status IS NOT NULL ORDER BY updated DESC").*
+- If User Specified a Project:
+  jql: "project = '<ProjectKey>' AND statusCategory != Done ORDER BY updated DESC"
+- Extract Fields: key, summary, status.name, priority.name, project.key, assignee.displayName.
+- Deduplication Check: Compare retrieved Jira task summaries and keys against internal workspace project tasks to identify new or missing tasks to suggest or bring over.
+
+### Step 3 — Safe Task / Issue Creation (Create Tasks):
+- Tool: createJiraIssue
+- Arguments:
+```json
+{
+  "cloudId": "<discovered_cloudId>",
+  "projectKey": "<projectKey>",
+  "summary": "<Concise, actionable task summary>",
+  "issueType": "Task",
+  "description": "<Detailed context, acceptance criteria, or source reference>"
+}
+```
+- Read-After-Write Verification: Confirm that the response contains the newly created issue key and id.
+
+## Strict Anti-Hallucination & Execution Rules
+- No Speculative Creation: Never tell the user an issue has been created until createJiraIssue returns a valid payload.
+- Never Restrict to Current User: Do not include assignee = currentUser() in JQL unless the user explicitly requested only their own tickets.
+- No Fabricated Keys or Links: Verbatim quote Jira keys (e.g. KAN-1) and use official URLs.
+- Workspace Deduplication: Always cross-reference against project tasks before creating or suggesting tasks to bring into this workspace.
+
+## Finalization Handshake
+End execution by calling finalize_result with data, resolved_context, and summary.
+
+## Execution Configuration
+```json
+{
+  "maxSteps": 3,
+  "pinnedTools": {
+    "jira": [
+      {
+        "name": "getAccessibleAtlassianResources",
+        "description": "Discover accessible Atlassian cloudId and resources. Always call first before running JQL or creating issues.",
+        "inputSchema": { "type": "object", "properties": {}, "required": [] }
+      },
+      {
+        "name": "searchJiraIssuesUsingJql",
+        "description": "Search Jira issues using JQL. Pass cloudId and bounded jql.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "cloudId": { "type": "string" },
+            "jql": { "type": "string" },
+            "maxResults": { "type": "number" }
+          },
+          "required": ["cloudId", "jql"]
+        }
+      },
+      {
+        "name": "createJiraIssue",
+        "description": "Create a new Jira issue/task. Requires cloudId, projectKey, summary, and issueType.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "cloudId": { "type": "string" },
+            "projectKey": { "type": "string" },
+            "summary": { "type": "string" },
+            "issueType": { "type": "string" },
+            "description": { "type": "string" }
+          },
+          "required": ["cloudId", "projectKey", "summary"]
+        }
+      }
+    ]
+  }
+}
+```""",
+    },
+    {
         "name": "incident_escalation_triage",
         "title": "Cross-App Production Incident Escalation",
         "connectorId": "sentry, linear, project",
@@ -688,8 +801,12 @@ async def fetch_active_skills_async(user_id: str = "") -> List[Dict[str, Any]]:
         data = await convex_post_async("getActiveSkills", {"userId": user_id or None})
         skills = data.get("skills") if isinstance(data, dict) else data
         if isinstance(skills, list) and skills:
-            print(f"[FETCH SKILLS] [OK] Retrieved {len(skills)} skill(s) from Convex DB.")
-            return skills
+            merged = list(skills)
+            for default_s in DEFAULT_SKILLS_FALLBACK:
+                if not any(s.get("name") == default_s.get("name") for s in merged):
+                    merged.append(default_s)
+            print(f"[FETCH SKILLS] [OK] Retrieved {len(skills)} skill(s) from Convex DB (total {len(merged)} active with defaults).")
+            return merged
     except Exception as e:
         safe_e = str(e).encode("ascii", "replace").decode("ascii")
         print(f"[FETCH SKILLS] Notice: Could not fetch skills from Convex endpoint ({safe_e}), using default skills catalog.")
