@@ -49,6 +49,7 @@ class SupervisorState(TypedDict):
     user_name: Optional[str]
     project_id: Optional[str]
     project_name: Optional[str]
+    project_deadline: Optional[str]
     thread_id: Optional[str]
 
     # 3. Router Execution Control (Single or Parallel Multi-Agent Fan-Out)

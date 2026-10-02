@@ -141,22 +141,6 @@ def get_sprint_insights(project_id: str) -> dict:
 
 
 @tool
-def get_project_insights(project_id: str) -> dict:
-    """Fetch basic project timeline information like deadline and days remaining.
-    Useful for overall project status and tracking against the final deadline.
-    """
-    print(f"[get_project_insights] querying — project={project_id}")
-    try:
-        data = convex_post_sync("getProjectInsights", {"projectId": project_id})
-        insights = data.get("projectInsights", {})
-        print(f"[get_project_insights] ✓ returned")
-        return insights
-    except Exception as e:
-        print(f"[get_project_insights] ✗ ERROR: {e}")
-        return {"error": str(e)}
-
-
-@tool
 def get_scheduler(project_id: str) -> dict:
     """Fetch the active automated report scheduler configuration for a project."""
     print(f"[get_scheduler] querying — project={project_id}")
@@ -211,14 +195,6 @@ async def fetch_sprint_insights_async(project_id: str) -> dict:
         return {"sprints": data.get("sprints", [])}
     except Exception as e:
         return {"error": f"Sprint insights fetch error: {e}"}
-
-
-async def fetch_project_insights_async(project_id: str) -> dict:
-    try:
-        data = await convex_post_async("getProjectInsights", {"projectId": project_id})
-        return data.get("projectInsights", {}) or {"status": "empty", "message": "No project insights available."}
-    except Exception as e:
-        return {"error": f"Project insights fetch error: {e}"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -330,7 +306,6 @@ ANALYST_TOOLS = [
     get_tasks_summary,
     get_issues_summary,
     get_member_workload,
-    get_project_insights,
 ]
 
 # Sprint Management Tools

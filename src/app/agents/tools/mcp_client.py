@@ -1090,13 +1090,11 @@ async def execute_mcp_agent_workflow(
                     fetch_tasks_summary_async,
                     fetch_issues_summary_async,
                     fetch_member_workload_async,
-                    fetch_project_insights_async,
                 )
                 tasks_f = fetch_tasks_summary_async(project_id)
                 issues_f = fetch_issues_summary_async(project_id)
                 workload_f = fetch_member_workload_async(project_id)
-                insights_f = fetch_project_insights_async(project_id)
-                t_res, i_res, w_res, ins_res = await asyncio.gather(tasks_f, issues_f, workload_f, insights_f, return_exceptions=True)
+                t_res, i_res, w_res = await asyncio.gather(tasks_f, issues_f, workload_f, return_exceptions=True)
 
                 if isinstance(t_res, dict) and not t_res.get("error"):
                     source_context_lines.append(f"### Internal Project Tasks:\n{t_res.get('summary') or str(t_res)}")
@@ -1109,8 +1107,6 @@ async def execute_mcp_agent_workflow(
                             f"- {m.get('name', 'Member')}: {m.get('activeTasksCount', 0)} active tasks, {m.get('totalLoggedHours', 0)} hrs logged"
                             for m in members
                         ))
-                if isinstance(ins_res, dict) and not ins_res.get("error"):
-                    source_context_lines.append(f"### Project Overview & Health:\n{ins_res.get('summary') or str(ins_res)}")
             except Exception as e:
                 logger.warning(f"Could not load internal project data for sink: {e}")
 

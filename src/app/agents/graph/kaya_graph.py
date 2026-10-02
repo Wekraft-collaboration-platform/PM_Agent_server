@@ -46,7 +46,6 @@ from app.agents.tools.tools import (
     fetch_issues_summary_async,
     fetch_member_workload_async,
     fetch_sprint_insights_async,
-    fetch_project_insights_async,
     fetch_active_skills_async,
     write_calendar_event_to_convex,
     write_sprint_to_convex,
@@ -498,23 +497,24 @@ async def analyst_worker_node(state: SupervisorState, config: RunnableConfig) ->
         # Determine specific tools needed based on user query
         has_task_kw = any(k in user_query for k in ["task", "tasks", "todo", "to-do", "to do", "assigned", "backlog", "story", "stories"])
         has_issue_kw = any(k in user_query for k in ["issue", "issues", "bug", "bugs", "error", "errors", "crash", "sentry", "linear", "defect", "incident", "problem", "problems", "fail", "failure", "unresolved"])
-        has_standup_kw = any(k in user_query for k in ["standup", "my standup", "today's work", "what did i do", "what should i do"])
+        has_standup_kw = any(k in user_query for k in [
+            "standup", "stand up", "my work", "my task", "my tasks", "my issues",
+            "what is my", "what i need to do", "what should i do", "today's work",
+            "what did i do", "assigned to me", "my assignment", "my work items",
+            "what am i working on", "my status", "for me", "me"
+        ])
         has_workload_kw = any(k in user_query for k in ["workload", "team", "members", "who is working", "capacity", "distribution"])
-        has_timeline_kw = any(k in user_query for k in ["timeline", "deadline", "milestone", "due date", "when is", "schedule"])
-        is_general_query = not (has_task_kw or has_issue_kw or has_standup_kw or has_workload_kw or has_timeline_kw)
+        is_general_query = not (has_task_kw or has_issue_kw or has_standup_kw or has_workload_kw)
 
         need_tasks = has_task_kw or is_general_query
         need_issues = has_issue_kw or is_general_query
-        need_standup = has_standup_kw
+        need_standup = has_standup_kw or is_general_query
         need_workload = has_workload_kw
-        need_timeline = has_timeline_kw or is_general_query
 
         if need_tasks:
             _emit_stream_status(tool_called="get_tasks_summary", caller="Project analyst")
         if need_issues:
             _emit_stream_status(tool_called="get_issues_summary", caller="Project analyst")
-        if need_timeline:
-            _emit_stream_status(tool_called="get_project_insights", caller="Project analyst")
         if need_standup:
             _emit_stream_status(tool_called="get_user_standup", caller="Project analyst")
         if need_workload:
@@ -523,18 +523,16 @@ async def analyst_worker_node(state: SupervisorState, config: RunnableConfig) ->
         # Execute read tools in parallel concurrently (only those actually needed)
         tasks_future = fetch_tasks_summary_async(project_id) if need_tasks else asyncio.sleep(0, result=None)
         issues_future = fetch_issues_summary_async(project_id) if need_issues else asyncio.sleep(0, result=None)
-        project_future = fetch_project_insights_async(project_id) if need_timeline else asyncio.sleep(0, result=None)
-        standup_future = fetch_user_standup_async(project_id, user_id) if need_standup else asyncio.sleep(0, result=None)
+        standup_future = fetch_user_standup_async(project_id, user_id) if (need_standup and user_id) else asyncio.sleep(0, result=None)
         workload_future = fetch_member_workload_async(project_id) if need_workload else asyncio.sleep(0, result=None)
 
-        tasks_res, issues_res, project_res, standup_res, workload_res = await asyncio.gather(
-            tasks_future, issues_future, project_future, standup_future, workload_future, return_exceptions=True
+        tasks_res, issues_res, standup_res, workload_res = await asyncio.gather(
+            tasks_future, issues_future, standup_future, workload_future, return_exceptions=True
         )
 
         # Normalize exceptions if any individual tool failed
         tasks_data = tasks_res if not isinstance(tasks_res, Exception) else {"error": str(tasks_res)}
         issues_data = issues_res if not isinstance(issues_res, Exception) else {"error": str(issues_res)}
-        project_data = project_res if not isinstance(project_res, Exception) else {"error": str(project_res)}
         standup_data = standup_res if not isinstance(standup_res, Exception) else {"error": str(standup_res)}
         workload_data = workload_res if not isinstance(workload_res, Exception) else {"error": str(workload_res)}
 
@@ -581,31 +579,26 @@ async def analyst_worker_node(state: SupervisorState, config: RunnableConfig) ->
                         assignees = ", ".join(iss.get("assignees", [])) if isinstance(iss.get("assignees"), list) else "Unassigned"
                         lines.append(f"  • Issue Title: '{title}' | Severity: {sev} | Status: {status} | Assignee: {assignees}")
 
-        # Project Timeline Section (only if requested)
-        if project_data is not None and "error" not in project_data and project_data:
-            p_name = project_data.get("projectName", "Active Project")
-            deadline = project_data.get("deadline") or "Not set"
-            days_left = project_data.get("daysRemaining")
-            days_str = f"{days_left} days remaining" if days_left is not None else "No deadline set"
-            lines.append(f"- **Project Information**: Name: '{p_name}' | Target Deadline: {deadline} ({days_str})")
-
         # Standup Section
-        if need_standup and "error" not in standup_data and standup_data:
-            user_tasks = standup_data.get("tasks", [])
-            lines.append(f"- **User Daily Standup**: {len(user_tasks)} task(s) assigned to current user.")
+        if need_standup and standup_data and "error" not in standup_data:
+            user_tasks = standup_data.get("tasks", []) or standup_data.get("assignedTasks", [])
+            lines.append(f"- **Current User Work & Standup**: {len(user_tasks)} task(s) directly assigned to you.")
             for ut in user_tasks:
-                lines.append(f"  • '{ut.get('title', 'Task')}' (Status: {ut.get('status', 'unknown')}, Priority: {ut.get('priority', 'medium')})")
+                if isinstance(ut, dict):
+                    lines.append(f"  • Task: '{ut.get('title', 'Task')}' (Status: {ut.get('status', 'unknown')}, Priority: {ut.get('priority', 'medium')})")
+                else:
+                    lines.append(f"  • Task: '{ut}'")
 
         # Workload Section
-        if need_workload and "error" not in workload_data and workload_data:
+        if need_workload and workload_data and "error" not in workload_data:
             members = workload_data.get("members", [])
             lines.append(f"- **Team Workload Breakdown**: {len(members)} team member(s) tracked.")
             for m in members:
                 m_name = m.get("name", "Unknown")
                 m_role = m.get("role", "member")
-                m_tasks = m.get("totalTasks", len(m.get("tasks", [])))
-                m_issues = m.get("totalIssues", len(m.get("issues", [])))
-                lines.append(f"  • Member: {m_name} ({m_role}) -> Tasks Assigned: {m_tasks} | Issues: {m_issues}")
+                tasks_val = m.get("totalTasks") if m.get("totalTasks") is not None else len(m.get("tasks", [])) if isinstance(m.get("tasks"), list) else m.get("tasks", 0)
+                issues_val = m.get("totalIssues") if m.get("totalIssues") is not None else len(m.get("issues", [])) if isinstance(m.get("issues"), list) else m.get("issues", 0)
+                lines.append(f"  • Member: {m_name} ({m_role}) -> Tasks Assigned: {tasks_val} | Issues: {issues_val}")
 
         # Document Analysis Section (if PRD/specification doc is attached or referenced)
         file_id = state.get("file_id")
@@ -646,7 +639,6 @@ async def analyst_worker_node(state: SupervisorState, config: RunnableConfig) ->
         return {
             "_analyst_messages": [RESET_SENTINEL, {"role": "analyst", "content": findings_text}],
             "standup_data": standup_data if need_standup else None,
-            "project_insights": project_data,
             "file_id": file_id,
         }
 
@@ -1061,17 +1053,11 @@ async def sprint_worker_node(state: SupervisorState, config: RunnableConfig) -> 
 
     try:
         _emit_stream_status(tool_called="get_sprint_insights", caller="Sprint manager")
-        _emit_stream_status(tool_called="get_project_insights", caller="Sprint manager")
 
-        # Fetch sprint insights and project insights in parallel
-        sprints_res, project_res = await asyncio.gather(
-            fetch_sprint_insights_async(project_id),
-            fetch_project_insights_async(project_id),
-            return_exceptions=True,
-        )
-
-        sprint_data = sprints_res if not isinstance(sprints_res, Exception) else {"error": str(sprints_res)}
-        project_data = project_res if not isinstance(project_res, Exception) else {}
+        # Fetch sprint insights
+        sprint_data = await fetch_sprint_insights_async(project_id)
+        if isinstance(sprint_data, Exception):
+            sprint_data = {"error": str(sprint_data)}
 
         lines = ["### Sprint Sub-Agent Findings:"]
         if "error" in sprint_data:
@@ -1087,9 +1073,6 @@ async def sprint_worker_node(state: SupervisorState, config: RunnableConfig) -> 
             if active_sprints:
                 curr = active_sprints[0]
                 lines.append(f"- **Current Active Sprint**: '{curr.get('name', 'Sprint')}' (Goal: {curr.get('goal', 'N/A')})")
-
-        if project_data and "deadline" in project_data:
-            lines.append(f"- **Project Target Deadline**: {project_data.get('deadline')}")
 
         findings_text = "\n".join(lines)
 
@@ -1239,6 +1222,7 @@ async def kaya_direct_node(state: SupervisorState, config: RunnableConfig) -> Di
     _emit_stream_status(status_text="Kaya is typing...")
     user_name = state.get("user_name") or "there"
     project_name = state.get("project_name") or "your active project"
+    project_deadline = state.get("project_deadline") or "No deadline currently set"
     current_date = datetime.now().strftime("%A, %B %d, %Y")
 
     system_prompt = f"""You are Kaya, an Executive Technical Project Manager on the WEKRAFT Platform.
@@ -1247,6 +1231,7 @@ You are actively managing the project "{project_name}".
 CONVERSATION CONTEXT:
 - Today's Real-World Date: {current_date}
 - Project Name: {project_name}
+- Project Target Deadline: {project_deadline}
 - User Name: {user_name}
 
 YOUR OPERATING PRINCIPLES:
@@ -1268,21 +1253,30 @@ async def kaya_synthesizer_node(state: SupervisorState, config: RunnableConfig) 
     """
     Kaya Synthesizer Node:
     - Ingests all sub-agent worker outputs (_analyst_messages, _db_write_messages, _sprint_messages, _mcp_messages).
-    - Injects project details, deadline awareness, and current date.
+    - Injects project details, deadline awareness directly from state, and current date.
     - Synthesizes findings using gpt-4.1-mini, streaming executive PM tokens to user.
     """
     _emit_stream_status(status_text="Kaya is synthesizing executive PM insights...")
     user_name = state.get("user_name") or "there"
     current_date = datetime.now().strftime("%A, %B %d, %Y")
 
-    # Project deadline and name awareness check
-    project_insights = state.get("project_insights") or {}
-    project_name = project_insights.get("projectName") or state.get("project_name") or "Active Project"
-    deadline_val = project_insights.get("deadline")
-    days_left = project_insights.get("daysRemaining")
+    # Project deadline and name awareness check directly from state
+    project_name = state.get("project_name") or "Active Project"
+    raw_deadline = state.get("project_deadline")
 
-    if deadline_val:
-        deadline_text = f"{deadline_val} ({days_left} day(s) remaining from today)"
+    if raw_deadline and raw_deadline != "No deadline currently set":
+        deadline_text = str(raw_deadline)
+        try:
+            from dateutil import parser as dt_parser
+            d_dt = dt_parser.parse(str(raw_deadline))
+            now_dt = datetime.now()
+            days_diff = (d_dt.date() - now_dt.date()).days
+            if days_diff >= 0:
+                deadline_text = f"{raw_deadline} ({days_diff} day(s) remaining from today)"
+            else:
+                deadline_text = f"{raw_deadline} ({abs(days_diff)} day(s) overdue)"
+        except Exception:
+            pass
     else:
         deadline_text = "No deadline currently set"
 
