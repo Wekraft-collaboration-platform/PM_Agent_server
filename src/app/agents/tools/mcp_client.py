@@ -49,25 +49,42 @@ DEFAULT_MCP_URLS: Dict[str, str] = {
     "posthog": "https://mcp.posthog.com/mcp",
 }
 
+APP_ALIASES: Dict[str, Set[str]] = {
+    "jira": {"jira", "zira", "jirah", "jra", "atlassian", "jira-cloud", "jira-software", "jiracloud"},
+    "linear": {"linear", "linar", "linera", "lineer", "linear-app"},
+    "slack": {"slack", "slak", "slck", "slaack"},
+    "calendly": {"calendly", "calendy", "calenderly", "calendli"},
+    "notion": {"notion", "notn", "notio", "notion-app"},
+    "sentry": {"sentry", "sentri", "sntery", "sentry-io"},
+    "github": {"github", "gthub", "git-hub", "gh", "git"},
+    "vercel": {"vercel", "vercl", "varcel"},
+    "supabase": {"supabase", "superbase"},
+    "neon": {"neon", "neondb"},
+    "stripe": {"stripe"},
+    "posthog": {"posthog", "post-hog"},
+    "hubspot": {"hubspot", "hub-spot"},
+    "mcp": {"mcp"},
+}
+
 # Connector category keywords for intent-based Smart Tool Pruning
 CONNECTOR_KEYWORDS: Dict[str, List[str]] = {
     "slack": [
-        "slack", "message", "channel", "chat", "team", "dm", "post", "send message", "thread", "conversation", "huddle"
+        "slack", "slak", "message", "channel", "chat", "team", "dm", "post", "send message", "thread", "conversation", "huddle"
     ],
     "calendly": [
-        "calendly", "schedule", "meeting", "booking", "availability", "slot", "invite", "calendar link", "event type", "reschedule"
+        "calendly", "calendy", "schedule", "meeting", "booking", "availability", "slot", "invite", "calendar link", "event type", "reschedule"
     ],
     "linear": [
-        "linear", "ticket", "issue", "cycle", "roadmap", "backlog item", "linear sprint", "linear task"
+        "linear", "linar", "ticket", "issue", "cycle", "roadmap", "backlog item", "linear sprint", "linear task"
     ],
     "notion": [
         "notion", "doc", "page", "prd", "spec", "wiki", "workspace doc", "database", "notes", "rfc"
     ],
     "jira": [
-        "jira", "epic", "story", "board", "jira ticket", "jira issue", "atlassian"
+        "jira", "zira", "jra", "atlassian", "epic", "story", "board", "jira ticket", "jira issue"
     ],
     "sentry": [
-        "sentry", "error", "exception", "crash", "stacktrace", "issue", "bug", "alert", "incident"
+        "sentry", "sentri", "error", "exception", "crash", "stacktrace", "issue", "bug", "alert", "incident"
     ],
     "hubspot": [
         "hubspot", "crm", "contact", "deal", "lead", "company", "marketing", "pipeline", "sales"
@@ -381,8 +398,9 @@ def smart_prune_connectors(
         meta = c.get("metadata", {}) or {}
         display = meta.get("displayName", c_id).lower()
 
-        # Build dynamic token set from connectorId and displayName
-        raw_tokens = {c_id, display, *display.split(), *c_id.split("_")}
+        aliases = APP_ALIASES.get(c_id, {c_id})
+        # Build dynamic token set from connectorId, aliases, and displayName
+        raw_tokens = {c_id, display, *aliases, *display.split(), *c_id.split("_")}
         tokens = {tok for tok in raw_tokens if len(tok) >= 3 and tok not in generic_stopwords}
 
         if any(tok and tok in q for tok in tokens):
@@ -794,7 +812,8 @@ async def _run_worker_loop(
             f"1. You are operating in STRICT SKILL EXECUTION MODE. Follow the exact step-by-step instructions in the Skill Manual above.\n"
             f"2. You are equipped ONLY with the exact tools needed for this skill: {[t['name'] for t in active_tools]}.\n"
             f"3. If the skill calls for creating or mutating resources (e.g. creating pages, issues, updating records), YOU MUST EXECUTE the corresponding creation/update tool. Do NOT skip tool calls or guess results.\n"
-            f"4. Once the skill steps are completed, call `{FINALIZE_TOOL}` with the structured output, URLs/IDs generated, and markdown summary."
+            f"4. NEVER output conversational filler like 'Please hold on', 'I will now compare', 'Please wait', or intermediate promises. You are a backend data worker.\n"
+            f"5. Once tools return data, immediately extract the items (keys, titles, statuses, assignees) and call `{FINALIZE_TOOL}` with the structured output, URLs/IDs generated, and full markdown summary."
         )
     else:
         system_prompt = (
@@ -811,7 +830,7 @@ async def _run_worker_loop(
             f"3. When fetching lists of items, use reasonable general filters (e.g. limit: 20 or recent items) "
             f"so valid data is not filtered out by local display name mismatches.\n"
             f"4. If a call returns 404 or missing parameter, inspect the error, call a discovery tool if needed, and retry.\n"
-            f"5. End your turn by calling `{FINALIZE_TOOL}` with the structured results ('data'), resolved context, and a clear markdown summary."
+            f"5. NEVER output conversational filler like 'Please hold on', 'Please wait', or 'I will now compare'. End your turn by calling `{FINALIZE_TOOL}` with the structured results ('data'), resolved context, and a clear markdown summary of all retrieved items."
         )
 
     messages: List[Any] = [
@@ -988,6 +1007,31 @@ async def _run_worker_loop(
 # 5. MASTER DISPATCHER (Parallel Fan-Out & Synthesizer Formatting)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _emit_stream_status(
+    status_text: Optional[str] = None,
+    reasoning: Optional[str] = None,
+    tool_called: Optional[str] = None,
+    caller: Optional[str] = None,
+):
+    """Emits SSE custom event for frontend live reasoning and status."""
+    try:
+        from langgraph.config import get_stream_writer
+        writer = get_stream_writer()
+        payload = {}
+        if status_text:
+            payload["agent_status"] = status_text
+        if reasoning:
+            payload["reasoning"] = reasoning
+        if tool_called:
+            payload["tool_called"] = tool_called
+            if caller:
+                payload["caller"] = caller
+        if payload:
+            writer(payload)
+    except Exception:
+        pass
+
+
 async def execute_mcp_agent_workflow(
     project_id: str,
     user_query: str,
@@ -1042,16 +1086,32 @@ async def execute_mcp_agent_workflow(
             "failures": [],
         }
     connected_app_names = [c.get("connectorId", "unknown").capitalize() for c in target_connections]
+    target_apps_str = ", ".join(connected_app_names) if connected_app_names else "workspace tools"
 
-    mcp_model = os.getenv("MCP_AGENT_MODEL", "gpt-4.1-mini")
+    if selected_skill:
+        skill_clean = selected_skill.replace("_", " ")
+        mcp_reasoning = f"Executing '{skill_clean}' skill: orchestrating tool queries across {target_apps_str} to extract real-time project context."
+    else:
+        mcp_reasoning = f"Querying connected workspace integrations ({target_apps_str}) to gather live issue tickets, incidents, and activity."
+
+    _emit_stream_status(
+        status_text=f"MCP Agent querying {target_apps_str}...",
+        reasoning=mcp_reasoning,
+    )
+
+    mcp_model = os.getenv("MCP_AGENT_MODEL", "gpt-5-mini")
     openai_api_key = os.getenv("OPENAI_API_KEY", "")
 
-    llm = ChatOpenAI(
-        model=mcp_model,
-        openai_api_key=openai_api_key,
-        temperature=0.0,
-        max_retries=2,
-    )
+    kwargs: Dict[str, Any] = {
+        "model": mcp_model,
+        "openai_api_key": openai_api_key,
+        "temperature": 0.0,
+        "max_retries": 2,
+    }
+    if any(m in mcp_model.lower() for m in ["gpt-5", "o1", "o3", "o4"]):
+        kwargs["model_kwargs"] = {"reasoning_effort": "low"}
+
+    llm = ChatOpenAI(**kwargs)
 
     t0 = time.monotonic()
 

@@ -18,10 +18,11 @@ Architecture:
 """
 
 import os
+import re
 import json
 import asyncio
 from datetime import datetime
-from typing import List, Dict, Any, Optional, Union, Tuple
+from typing import List, Dict, Any, Optional, Union, Tuple, Set
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
@@ -88,12 +89,14 @@ Analyze the user's incoming query (and previous query context if provided) and m
 2. Select the SINGLE most appropriate procedural skill ('selected_skill') from the Available Skills Catalog, or null if none match.
 
 CRITICAL RULES:
-1. CREATING TASKS, ISSUES, EVENTS IN THIS PROJECT:
-   - When the user asks to create, add, or generate tasks, issues, or calendar events (e.g., 'create 3 issues for these errors', 'create tasks', 'schedule meeting'), it ALWAYS targets this project's internal database -> route to 'db_write' (DB Write Agent).
-   - NEVER call 'mcp' for creating tasks or issues unless the user explicitly specifies an external third-party destination (e.g., 'create issue in Jira', 'create ticket in Linear').
+1. CREATING / IMPORTING TASKS, ISSUES, EVENTS IN THIS PROJECT:
+   - When the user asks to create, add, insert, generate, or bring in tasks/issues (e.g., 'okay bring those task in, i want to create those task u said', 'create 3 issues for these errors', 'create tasks', 'schedule meeting', 'add those tasks into our project'), it targets this project's internal database -> route to 'db_write' (DB Write Agent) ONLY.
+   - For follow-up task creation/importing commands ('bring those tasks in', 'create those tasks you said', 'add them to my project'): Select ONLY ['db_write'] and set selected_skill to null. NEVER re-invoke 'mcp' or 'analyst' for pure creation follow-ups.
+   - NEVER call 'mcp' for creating internal project tasks even if the tasks originated from Jira, Linear, or Sentry findings.
 
 2. THIRD-PARTY / MCP AGENT ('mcp'):
    - ONLY call 'mcp' if the user EXPLICITLY asks to query or mutate a connected third-party SaaS service (Jira, Linear, Slack, Calendly, Notion, Sentry, Vercel, HubSpot, GitHub, Supabase, Stripe, PostHog, MCP).
+   - PHONETIC & TYPO TOLERANCE: Treat common phonetic variations or typos of SaaS names as the intended integration (e.g., 'Zira'/'Jra'/'Atlassian' -> Jira, 'Linar' -> Linear, 'Slak' -> Slack, 'Gaya' -> Kaya).
    - NEVER call 'mcp' for general coding jargon or project terms like "repository", "codebase", "branch", "commit", "prs", "tasks", "issues", "standup", "sprint", or "bugs" unless an external service is explicitly named.
    - NEGATION RESPECT: If the user says "without Jira", "don't check Sentry", "skip Slack", or "no external tools", do NOT include 'mcp'.
 
@@ -107,6 +110,8 @@ CRITICAL RULES:
    - Select the purest atomic skill that matches the exact connectors requested by the user. If none apply, set selected_skill to null.
 
 FEW-SHOT ROUTING EXAMPLES:
+- Query: "okay bring those task in , i want to create those task u said !"
+  -> actions: ["db_write"], selected_skill: null, reasoning: "User confirms creation of previously discussed tasks into internal project database; route to db_write only."
 - Query: "What tasks are blocked in our repository?"
   -> actions: ["analyst"], selected_skill: null, reasoning: "Internal project task summary; 'repository' refers to internal codebase, no external tools requested."
 - Query: "Summarize our sprint velocity and workload without touching Jira"
@@ -129,6 +134,37 @@ Available Skills Catalog (Level 1 Metadata):
 """
 
 
+# Canonical App Aliases mapping typos and variations to official connector IDs
+APP_ALIASES: Dict[str, Set[str]] = {
+    "jira": {"jira", "zira", "jirah", "jra", "atlassian", "jira-cloud", "jira-software", "jiracloud"},
+    "linear": {"linear", "linar", "linera", "lineer", "linear-app"},
+    "slack": {"slack", "slak", "slck", "slaack"},
+    "calendly": {"calendly", "calendy", "calenderly", "calendli"},
+    "notion": {"notion", "notn", "notio", "notion-app"},
+    "sentry": {"sentry", "sentri", "sntery", "sentry-io"},
+    "github": {"github", "gthub", "git-hub", "gh", "git"},
+    "vercel": {"vercel", "vercl", "varcel"},
+    "supabase": {"supabase", "superbase"},
+    "neon": {"neon", "neondb"},
+    "stripe": {"stripe"},
+    "posthog": {"posthog", "post-hog"},
+    "hubspot": {"hubspot", "hub-spot"},
+    "mcp": {"mcp"},
+}
+
+STRICT_MCP_APP_NAMES = set(APP_ALIASES.keys())
+
+def extract_mentioned_mcp_apps(text: str) -> Set[str]:
+    """Extracts canonical MCP app names from text with typo and alias tolerance."""
+    lower_text = text.lower()
+    words = set(re.findall(r'[a-zA-Z0-9_\-]+', lower_text))
+    matched_apps = set()
+    for canonical_app, aliases in APP_ALIASES.items():
+        if any(alias in words or f" {alias} " in f" {lower_text} " or f"'{alias}'" in lower_text or f'"{alias}"' in lower_text for alias in aliases):
+            matched_apps.add(canonical_app)
+    return matched_apps
+
+
 def resolve_skill_selection(
     text: str,
     active_skills: List[Dict[str, Any]],
@@ -138,7 +174,7 @@ def resolve_skill_selection(
     Resolves the best matching skill name and content.
     1. Verifies if selected_skill exists in active_skills.
     2. If missing, null, or mismatched, falls back to scoring active_skills against connector/tool keywords
-       present in the query.
+       present in the query with alias/typo resolution.
        HEAVILY penalizes skills with 3rd-party connectors that the user DID NOT ask for.
     """
     if selected_skill:
@@ -146,10 +182,7 @@ def resolve_skill_selection(
             if s.get("name") == selected_skill:
                 return selected_skill, s.get("content")
 
-    lower_text = text.lower()
-    known_apps = ["jira", "linear", "sentry", "notion", "supabase", "slack", "calendly", "hubspot", "vercel", "github"]
-    mentioned_apps = [app for app in known_apps if app in lower_text]
-
+    mentioned_apps = extract_mentioned_mcp_apps(text)
     if not mentioned_apps:
         return None, None
 
@@ -185,12 +218,6 @@ def resolve_skill_selection(
 
     return None, None
 
-
-# Strict external SaaS names (coding jargon like "repo", "branch", "commit" are intentionally excluded)
-STRICT_MCP_APP_NAMES = {
-    "jira", "linear", "slack", "calendly", "notion", "hubspot", "sentry",
-    "vercel", "github", "supabase", "neon", "stripe", "posthog", "mcp"
-}
 
 NEGATION_PREFIXES = ("without", "don't", "dont", "do not", "skip", "ignore", "exclude", "no ", "never ")
 
@@ -228,11 +255,13 @@ def _sanitize_and_guard_decision(
     # 2. Check for explicit negations targeting SaaS apps (e.g. "without Jira", "skip sentry")
     negated_apps = set()
     for app in STRICT_MCP_APP_NAMES:
-        if any(f"{neg}{app}" in lower_latest or f"{neg} {app}" in lower_latest for neg in NEGATION_PREFIXES):
-            negated_apps.add(app)
+        aliases = APP_ALIASES.get(app, {app})
+        for alias in aliases:
+            if any(f"{neg}{alias}" in lower_latest or f"{neg} {alias}" in lower_latest for neg in NEGATION_PREFIXES):
+                negated_apps.add(app)
 
-    # 3. Detect positively requested SaaS apps
-    mentioned_apps = {app for app in STRICT_MCP_APP_NAMES if app in lower_latest and app not in negated_apps}
+    # 3. Detect positively requested SaaS apps (with typo and alias tolerance)
+    mentioned_apps = extract_mentioned_mcp_apps(lower_latest) - negated_apps
 
     # 4. MCP Sanitization: If 'mcp' was added but no valid external app is mentioned (or all were negated)
     if "mcp" in decision.actions:
@@ -565,6 +594,29 @@ async def analyst_worker_node(state: SupervisorState, config: RunnableConfig) ->
         need_workload = has_workload_kw
         need_sprint = has_sprint_kw or is_general_query
 
+        # Formulate active Project Analyst reasoning
+        reasoning_actions = []
+        if need_standup:
+            reasoning_actions.append("your personal standup and assigned work items")
+        if need_tasks:
+            reasoning_actions.append("active project task backlog")
+        if need_issues:
+            reasoning_actions.append("unresolved issues & blocker bugs")
+        if need_workload:
+            reasoning_actions.append("team member workload distribution")
+        if need_sprint:
+            reasoning_actions.append("sprint velocity and timeline progress")
+        if state.get("file_id"):
+            reasoning_actions.append("attached PRD/spec document architecture")
+
+        reasoning_summary = ", ".join(reasoning_actions) if reasoning_actions else "project tasks, issues, and sprint status"
+        analyst_reasoning = f"Analyzing {reasoning_summary} to evaluate progress, team workload, and critical path blockers."
+
+        _emit_stream_status(
+            status_text="Project Analyst is analyzing...",
+            reasoning=analyst_reasoning,
+        )
+
         if need_tasks:
             _emit_stream_status(tool_called="get_tasks_summary", caller="Project analyst")
         if need_issues:
@@ -724,6 +776,10 @@ async def analyst_worker_node(state: SupervisorState, config: RunnableConfig) ->
                         )),
                         HumanMessage(content=f"Document Filename: {filename}\n\nDocument Content:\n{doc_md[:25000]}\n\nUser Question/Focus: '{user_query}'"),
                     ]
+                    _emit_stream_status(
+                        status_text=f"Project Analyst evaluating {filename}...",
+                        reasoning=f"Evaluating technical specifications in '{filename}' to identify architectural risks, unhandled edge cases, and PM action items.",
+                    )
                     eval_llm = get_analyst_llm()
                     eval_res = await eval_llm.ainvoke(eval_prompt)
                     lines.append(f"\n### PRD / Document Review & Critical Issues ({filename}):\n{eval_res.content}")
