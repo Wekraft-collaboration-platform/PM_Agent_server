@@ -76,7 +76,7 @@ CONNECTOR_KEYWORDS: Dict[str, List[str]] = {
         "vercel", "deployment", "deploy", "domain", "project", "env", "environment", "build", "alias", "preview"
     ],
     "github": [
-        "github", "pull request", "pull requests", "pr", "prs", "repo", "repository", "codebase", "commit", "commits", "branch", "branches", "release", "releases", "merge", "git", "diff", "review", "code"
+        "github", "pull request", "pull requests", "github pr", "github repo", "github repository", "github branch", "github commit", "github release", "git merge", "gh"
     ],
     "supabase": [
         "supabase", "sql", "database", "table", "schema", "postgres", "edge function", "storage", "migration", "query", "row"

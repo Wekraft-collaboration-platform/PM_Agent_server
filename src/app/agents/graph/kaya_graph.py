@@ -48,8 +48,6 @@ from app.agents.tools.tools import (
     fetch_sprint_insights_async,
     fetch_active_skills_async,
     write_calendar_event_to_convex,
-    write_sprint_to_convex,
-    write_items_to_sprint,
     write_bulk_tasks_to_convex,
     write_bulk_issues_to_convex,
 )
@@ -70,8 +68,7 @@ class SupervisorDecision(BaseModel):
             "List of sub-agent actions to trigger in parallel (select ONLY the sub-agents explicitly required):\n"
             "- 'mcp': ONLY for third-party external integrations (explicitly requested Jira, Linear, Slack, Calendly, Notion, Sentry, Vercel, MCP). NEVER call for internal project tasks/issues/sprints or if user hasn't asked for third party.\n"
             "- 'db_write': DB Write agent for creating tasks, issues, or calendar events in this project\n"
-            "- 'analyst': Project Analyst agent for internal project read analytics: user daily standup, task summaries, issue tracking, member workloads, project health, deadlines\n"
-            "- 'sprint': Sprint agent for sprint insights/velocity, active sprint status, sprint creation, or backlog item assignments\n"
+            "- 'analyst': Project Analyst agent for all internal read analytics: user daily standup, task summaries, issue tracking, member workloads, sprint insights/velocity, project health, deadlines\n"
             "- 'direct_response': simple greeting, casual conversation, or general product manager chat"
         )
     )
@@ -91,34 +88,41 @@ Analyze the user's incoming query (and previous query context if provided) and m
 2. Select the SINGLE most appropriate procedural skill ('selected_skill') from the Available Skills Catalog, or null if none match.
 
 CRITICAL RULES:
-1. CREATING TASKS, ISSUES, SPRINTS IN THIS PROJECT:
+1. CREATING TASKS, ISSUES, EVENTS IN THIS PROJECT:
    - When the user asks to create, add, or generate tasks, issues, or calendar events (e.g., 'create 3 issues for these errors', 'create tasks', 'schedule meeting'), it ALWAYS targets this project's internal database -> route to 'db_write' (DB Write Agent).
-   - When the user asks to create or plan sprints -> route to 'sprint' (Sprint Agent).
-   - NEVER call 'mcp' for creating tasks, issues, or sprints unless the user explicitly specifies an external third-party destination (e.g., 'create issue in Jira', 'create ticket in Linear'). Even if issues are based on previous Sentry errors, creating them is an internal project action.
+   - NEVER call 'mcp' for creating tasks or issues unless the user explicitly specifies an external third-party destination (e.g., 'create issue in Jira', 'create ticket in Linear').
 
 2. THIRD-PARTY / MCP AGENT ('mcp'):
-   - ONLY call 'mcp' if the user EXPLICITLY asks for a third-party app or external tool (Jira, Linear, Slack, Calendly, Notion, Sentry, Vercel, external service, MCP), OR if the current query is a follow-up referring back to a third-party app mentioned in the previous query.
-   - NEVER call 'mcp' for general project tasks, issues, sprints, or standups if no third-party integration was mentioned in either the current or previous query.
+   - ONLY call 'mcp' if the user EXPLICITLY asks to query or mutate a connected third-party SaaS service (Jira, Linear, Slack, Calendly, Notion, Sentry, Vercel, HubSpot, GitHub, Supabase, Stripe, PostHog, MCP).
+   - NEVER call 'mcp' for general coding jargon or project terms like "repository", "codebase", "branch", "commit", "prs", "tasks", "issues", "standup", "sprint", or "bugs" unless an external service is explicitly named.
+   - NEGATION RESPECT: If the user says "without Jira", "don't check Sentry", "skip Slack", or "no external tools", do NOT include 'mcp'.
 
-3. SPRINT AGENT ('sprint'):
-   - ALWAYS call 'sprint' whenever the user asks about sprints (sprint progress, active sprint, sprint velocity, sprint tasks, sprint items, sprint creation, sprint planning), or follows up on previous sprint context.
+3. ANALYST AGENT ('analyst'):
+   - Call 'analyst' for ALL internal project analytics: task summaries, active bugs/issues, daily standups, member workload distribution, sprint progress & velocity, project health, deadlines, and PRD reviews.
 
 4. MINIMAL SUB-AGENT CALLS:
-   - NEVER call extra sub-agents if not asked by the user. Route ONLY to the exact sub-agents necessary to fulfill the user's request.
+   - Route ONLY to the exact sub-agents necessary. If it's a simple greeting or general PM question with no database access needed, route to 'direct_response'.
 
-5. PROCEDURAL SKILL SELECTION RULES:
-   - Evaluate the Available Skills Catalog (Level 1 Metadata).
-   - CRITICAL MATCHING RULE: NEVER select a skill whose connector list or description requires a third-party service (e.g. Notion, Slack, Linear, Sentry) that the user DID NOT explicitly ask for in their prompt.
-   - For example: If the user asks for Jira tasks, select ONLY 'jira_issue_management'. Do NOT select 'jira_project_tasks_alignment_notion_sync' unless Notion is explicitly requested.
-   - Choose the purest atomic skill that matches the exact connectors requested by the user.
-   - If no specialized skill applies (e.g. casual conversation or generic query), set selected_skill to null.
+5. PROCEDURAL SKILL SELECTION:
+   - Select the purest atomic skill that matches the exact connectors requested by the user. If none apply, set selected_skill to null.
+
+FEW-SHOT ROUTING EXAMPLES:
+- Query: "What tasks are blocked in our repository?"
+  -> actions: ["analyst"], selected_skill: null, reasoning: "Internal project task summary; 'repository' refers to internal codebase, no external tools requested."
+- Query: "Summarize our sprint velocity and workload without touching Jira"
+  -> actions: ["analyst"], selected_skill: null, reasoning: "Internal sprint and workload analytics requested; user explicitly excluded Jira so MCP is omitted."
+- Query: "Fetch the latest unresolved crashes from Sentry and list open Linear tickets"
+  -> actions: ["mcp"], selected_skill: "incident_escalation_triage", reasoning: "External Sentry and Linear telemetry explicitly requested."
+- Query: "Create 4 tasks for the Stripe webhook refactor"
+  -> actions: ["db_write"], selected_skill: null, reasoning: "User wants to create internal project tasks."
+- Query: "Hi Kaya, how are you doing today?"
+  -> actions: ["direct_response"], selected_skill: null, reasoning: "Casual greeting requiring no tool or database execution."
 
 Available Sub-Agents:
-1. 'mcp': Third-party SaaS integrations ONLY (Jira, Linear, Slack, Calendly, Notion, Sentry, HubSpot, Vercel).
-2. 'db_write': DB Write agent for project mutations: internal task creation, issue creation, calendar event scheduling, report scheduler setup.
-3. 'analyst': Project Analyst agent for internal read-only analytics: User daily standup, task summaries, issue tracking, member workloads, project health, or project deadlines/timelines.
-4. 'sprint': Sprint velocity, active sprint progress, sprint creation, or backlog item allocation.
-5. 'direct_response': Greetings (hi, hello), casual conversation, or general questions requiring no live database queries.
+1. 'mcp': Third-party SaaS integrations ONLY (Jira, Linear, Slack, Calendly, Notion, Sentry, HubSpot, Vercel, GitHub).
+2. 'db_write': DB Write agent for project mutations: internal task creation, issue creation, calendar event scheduling.
+3. 'analyst': Project Analyst agent for all internal read-only analytics: daily standup, tasks, issues, workloads, sprint insights/velocity, project health, deadlines.
+4. 'direct_response': Greetings, casual conversation, general PM advice without database queries.
 
 Available Skills Catalog (Level 1 Metadata):
 {SKILLS_CATALOG_BLOCK}
@@ -134,16 +138,14 @@ def resolve_skill_selection(
     Resolves the best matching skill name and content.
     1. Verifies if selected_skill exists in active_skills.
     2. If missing, null, or mismatched, falls back to scoring active_skills against connector/tool keywords
-       (e.g., jira, notion, supabase, sentry, linear, slack, etc.) present in the query.
+       present in the query.
        HEAVILY penalizes skills with 3rd-party connectors that the user DID NOT ask for.
     """
-    # 1. Exact match check
     if selected_skill:
         for s in active_skills:
             if s.get("name") == selected_skill:
                 return selected_skill, s.get("content")
 
-    # 2. Connector / Keyword match fallback
     lower_text = text.lower()
     known_apps = ["jira", "linear", "sentry", "notion", "supabase", "slack", "calendly", "hubspot", "vercel", "github"]
     mentioned_apps = [app for app in known_apps if app in lower_text]
@@ -170,8 +172,6 @@ def resolve_skill_selection(
             elif app in title or app in desc:
                 score += 5
 
-        # Strict Penalty for extra 3rd-party connectors that user DID NOT ask for
-        # (e.g. if user only asks for Jira, severely penalize composite Jira+Notion skills)
         for conn in connectors:
             if conn not in ["project", "internal"] and conn not in mentioned_apps:
                 score -= 30
@@ -186,13 +186,104 @@ def resolve_skill_selection(
     return None, None
 
 
+# Strict external SaaS names (coding jargon like "repo", "branch", "commit" are intentionally excluded)
+STRICT_MCP_APP_NAMES = {
+    "jira", "linear", "slack", "calendly", "notion", "hubspot", "sentry",
+    "vercel", "github", "supabase", "neon", "stripe", "posthog", "mcp"
+}
+
+NEGATION_PREFIXES = ("without", "don't", "dont", "do not", "skip", "ignore", "exclude", "no ", "never ")
+
+
+def _sanitize_and_guard_decision(
+    decision: SupervisorDecision,
+    user_input: str,
+    active_skills: List[Dict[str, Any]],
+    has_attached_doc: bool = False,
+) -> Tuple[SupervisorDecision, Optional[str]]:
+    """
+    Zero-Latency In-Memory Guard (< 0.05ms):
+    - Respects negative qualifiers ("without Jira", "don't check Sentry").
+    - Strips spurious 'mcp' calls if no real external SaaS app is requested.
+    - Resolves procedural skill without network overhead.
+    """
+    latest_text = user_input
+    if "Current Query:" in user_input:
+        latest_text = user_input.split("Current Query:")[-1].strip()
+    lower_latest = latest_text.lower()
+
+    # 1. Ingest document hints if PRD/Doc is attached
+    if has_attached_doc or "[attached:" in lower_latest or "prd" in lower_latest or "doc" in lower_latest:
+        if any(k in lower_latest for k in ["create", "add", "make", "insert", "generate", "extract", "task", "tasks", "bulk"]):
+            if "db_write" not in decision.actions:
+                decision.actions.append("db_write")
+            if "direct_response" in decision.actions:
+                decision.actions.remove("direct_response")
+        elif any(k in lower_latest for k in ["critical", "issue", "issues", "bug", "bugs", "risk", "risks", "review", "tell me", "what", "analyze", "explain"]):
+            if "analyst" not in decision.actions:
+                decision.actions.append("analyst")
+            if "direct_response" in decision.actions:
+                decision.actions.remove("direct_response")
+
+    # 2. Check for explicit negations targeting SaaS apps (e.g. "without Jira", "skip sentry")
+    negated_apps = set()
+    for app in STRICT_MCP_APP_NAMES:
+        if any(f"{neg}{app}" in lower_latest or f"{neg} {app}" in lower_latest for neg in NEGATION_PREFIXES):
+            negated_apps.add(app)
+
+    # 3. Detect positively requested SaaS apps
+    mentioned_apps = {app for app in STRICT_MCP_APP_NAMES if app in lower_latest and app not in negated_apps}
+
+    # 4. MCP Sanitization: If 'mcp' was added but no valid external app is mentioned (or all were negated)
+    if "mcp" in decision.actions:
+        if not mentioned_apps and not decision.selected_skill:
+            decision.actions.remove("mcp")
+            decision.reasoning += " (MCP removed: query contains no positive external SaaS target)"
+            if not decision.actions:
+                decision.actions = ["analyst"] if any(k in lower_latest for k in ["task", "tasks", "issue", "issues", "workload", "standup", "health", "project"]) else ["direct_response"]
+    elif mentioned_apps and not any(neg in lower_latest for neg in ["without external", "no integrations"]):
+        # Safe addition: user explicitly named an un-negated SaaS connector
+        if "mcp" not in decision.actions:
+            if "direct_response" in decision.actions:
+                decision.actions.remove("direct_response")
+            decision.actions.append("mcp")
+            decision.reasoning += f" (MCP auto-included for {mentioned_apps})"
+
+    # 5. Sprint & Analytics Keyword Safety Clamp
+    analytics_keywords = ["sprint", "sprints", "velocity", "burndown", "task", "tasks", "issue", "issues", "standup", "workload", "health", "project"]
+    if any(k in lower_latest for k in analytics_keywords) and "analyst" not in decision.actions and "db_write" not in decision.actions:
+        if "direct_response" in decision.actions:
+            decision.actions.remove("direct_response")
+        decision.actions.append("analyst")
+
+    # 6. Clean up direct_response if actionable subagents exist
+    if len(decision.actions) > 1 and "direct_response" in decision.actions:
+        decision.actions.remove("direct_response")
+
+    # Ensure actions is never empty
+    if not decision.actions:
+        decision.actions = ["direct_response"]
+
+    # 7. Hydrate matched procedural skill
+    matched_skill_name, matched_content = resolve_skill_selection(
+        user_input, active_skills, decision.selected_skill
+    )
+    if matched_skill_name and not any(app in negated_apps for app in matched_skill_name.split("_")):
+        decision.selected_skill = matched_skill_name
+    else:
+        decision.selected_skill = None
+        matched_content = None
+
+    return decision, matched_content
+
+
 async def route_user_request(
     user_input: str,
     project_id: Optional[str] = None,
     user_id: Optional[str] = None,
     has_attached_doc: bool = False,
 ) -> Tuple[SupervisorDecision, Optional[str]]:
-    """Evaluates user input using Groq 120b LLM router, outputs structured SupervisorDecision, and returns matched skill content."""
+    """Evaluates user input using Groq 120b LLM router and applies zero-latency in-memory intent sanitization."""
     groq_api_key = os.getenv("GROQ_API_KEY", "")
     router_model = os.getenv("GROQ_ROUTER_MODEL", "openai/gpt-oss-120b")
 
@@ -223,67 +314,14 @@ async def route_user_request(
             max_retries=2,
         ).with_structured_output(SupervisorDecision)
 
-        decision: SupervisorDecision = await llm.ainvoke(messages)
-        # Ensure fallback if actions is empty
-        if not decision.actions:
-            decision.actions = ["direct_response"]
+        raw_decision: SupervisorDecision = await llm.ainvoke(messages)
+        if not raw_decision.actions:
+            raw_decision.actions = ["direct_response"]
 
-        latest_text = user_input
-        if "Current Query:" in user_input:
-            latest_text = user_input.split("Current Query:")[-1].strip()
-        lower_latest = latest_text.lower()
-        lower_query = user_input.lower()
-
-        # Document-specific routing rules
-        if has_attached_doc or "[attached:" in lower_query or "prd" in lower_latest or "doc" in lower_latest:
-            if any(k in lower_latest for k in ["create", "add", "make", "insert", "generate", "extract", "task", "tasks", "bulk"]):
-                if "db_write" not in decision.actions:
-                    decision.actions.append("db_write")
-                if "direct_response" in decision.actions:
-                    decision.actions.remove("direct_response")
-            elif any(k in lower_latest for k in ["critical", "issue", "issues", "bug", "bugs", "risk", "risks", "review", "tell me", "what", "analyze", "explain"]):
-                if "analyst" not in decision.actions:
-                    decision.actions.append("analyst")
-                if "direct_response" in decision.actions:
-                    decision.actions.remove("direct_response")
-
-        # Third-party overrides
-        mcp_keywords = ["jira", "linear", "slack", "calendly", "notion", "hubspot", "sentry", "vercel", "github", "pr", "prs", "pull request", "repo", "repository", "codebase", "branch", "commit", "mcp", "integration", "integrations"]
-        has_mcp_kw = any(k in lower_latest for k in mcp_keywords)
-        if has_mcp_kw:
-            if "mcp" not in decision.actions:
-                if "direct_response" in decision.actions:
-                    decision.actions.remove("direct_response")
-                decision.actions.append("mcp")
-        elif "mcp" in decision.actions and not decision.selected_skill:
-            # If no 3rd party keyword and no skill, remove spurious MCP call
-            decision.actions.remove("mcp")
-            if not decision.actions:
-                decision.actions = ["analyst"] if any(k in lower_latest for k in ["task", "tasks", "issue", "issues", "workload", "standup", "health", "project"]) else ["direct_response"]
-
-        # Sprint overrides
-        sprint_keywords = ["sprint", "sprints", "velocity", "backlog", "burndown"]
-        if any(k in lower_latest for k in sprint_keywords):
-            if "sprint" not in decision.actions:
-                if "direct_response" in decision.actions:
-                    decision.actions.remove("direct_response")
-                decision.actions.append("sprint")
-                decision.reasoning += " (Sprint agent auto-included due to sprint keyword match)"
-
-        # Rule 4: Clean up direct_response if actionable subagents exist
-        if len(decision.actions) > 1 and "direct_response" in decision.actions:
-            decision.actions.remove("direct_response")
-
-        # Hydrate or auto-resolve skill selection
-        matched_skill_name, matched_content = resolve_skill_selection(
-            user_input, active_skills, decision.selected_skill
+        # Apply zero-latency in-memory intent guard (< 0.05ms)
+        decision, matched_content = _sanitize_and_guard_decision(
+            raw_decision, user_input, active_skills, has_attached_doc=has_attached_doc
         )
-        if matched_skill_name:
-            if decision.selected_skill != matched_skill_name:
-                decision.reasoning += f" (Skill '{matched_skill_name}' auto-resolved via connector/keyword match)"
-            decision.selected_skill = matched_skill_name
-        else:
-            decision.selected_skill = None
 
         safe_reasoning = decision.reasoning.encode("ascii", "replace").decode("ascii")
         print(f"\n🎯 [ROUTER DECISION] Actions: {decision.actions} | Selected Skill: {decision.selected_skill or 'None'} | Reasoning: {safe_reasoning}\n")
@@ -298,27 +336,21 @@ async def route_user_request(
             latest_text = user_input.split("Current Query:")[-1].strip()
         lower_latest = latest_text.lower()
 
-        if any(k in lower_latest for k in ["sprint", "sprints", "velocity"]):
-            actions.append("sprint")
         if any(k in lower_latest for k in ["create", "add", "make", "insert", "schedule", "extract"]) and any(k in lower_latest for k in ["task", "tasks", "issue", "issues", "event", "these", "those"]):
             actions.append("db_write")
-        elif any(k in lower_latest for k in ["task", "tasks", "issue", "issues", "standup", "workload", "health", "project", "critical", "prd", "doc"]):
+        elif any(k in lower_latest for k in ["task", "tasks", "issue", "issues", "standup", "workload", "health", "project", "critical", "prd", "doc", "sprint", "sprints", "velocity"]):
             actions.append("analyst")
-        if any(k in lower_latest for k in ["jira", "linear", "slack", "calendly", "notion", "hubspot", "vercel", "sentry", "github", "pr", "prs", "repo", "repository", "codebase", "branch", "commit", "mcp"]):
+        if any(k in lower_latest for k in STRICT_MCP_APP_NAMES) and not any(f"{neg}{k}" in lower_latest or f"{neg} {k}" in lower_latest for neg in NEGATION_PREFIXES for k in STRICT_MCP_APP_NAMES):
             actions.append("mcp")
         if not actions:
             actions = ["direct_response"]
 
-        fallback_skill_name, fallback_content = resolve_skill_selection(
-            user_input, active_skills, None
-        )
-
-        fallback_decision = SupervisorDecision(
+        raw_fallback = SupervisorDecision(
             actions=actions,
-            selected_skill=fallback_skill_name,
+            selected_skill=None,
             reasoning=f"Fallback routing: {safe_err}",
         )
-        return fallback_decision, fallback_content
+        return _sanitize_and_guard_decision(raw_fallback, user_input, active_skills, has_attached_doc=has_attached_doc)
 
 
 
@@ -397,6 +429,29 @@ def _emit_stream_status(
         pass
 
 
+def get_analyst_llm() -> ChatOpenAI:
+    """Returns model for Analyst worker reasoning and document evaluation (gpt-5-mini with low reasoning effort for minimal latency)."""
+    analyst_model = os.getenv("ANALYST_MODEL", "gpt-5-mini")
+    openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if openai_key:
+        kwargs: Dict[str, Any] = {
+            "model": analyst_model,
+            "openai_api_key": openai_key,
+            "temperature": 0.1,
+        }
+        # For OpenAI reasoning models (gpt-5-mini / o-series), set reasoning effort to low for fastest response latency
+        if any(m in analyst_model.lower() for m in ["gpt-5", "o1", "o3", "o4"]):
+            kwargs["model_kwargs"] = {"reasoning_effort": "low"}
+        return ChatOpenAI(**kwargs)
+    groq_key = os.getenv("GROQ_API_KEY", "").strip()
+    return ChatOpenAI(
+        model=os.getenv("GROQ_ROUTER_MODEL", "openai/gpt-oss-120b"),
+        openai_api_key=groq_key or "none",
+        openai_api_base="https://api.groq.com/openai/v1",
+        temperature=0.1,
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. GRAPH NODES
 # ─────────────────────────────────────────────────────────────────────────────
@@ -432,8 +487,6 @@ async def supervisor_router_node(state: SupervisorState, config: RunnableConfig)
             _emit_stream_status(subagent_called="analyst_agent")
         elif action == "db_write":
             _emit_stream_status(subagent_called="db_write_agent")
-        elif action == "sprint":
-            _emit_stream_status(subagent_called="sprint_agent")
         elif action == "mcp":
             _emit_stream_status(subagent_called="mcp_agent")
 
@@ -460,8 +513,6 @@ def route_supervisor(state: SupervisorState) -> List[str]:
         target_nodes.append("analyst_node")
     if "db_write" in actions:
         target_nodes.append("db_write_node")
-    if "sprint" in actions:
-        target_nodes.append("sprint_node")
     if "mcp" in actions:
         target_nodes.append("mcp_node")
 
@@ -469,17 +520,18 @@ def route_supervisor(state: SupervisorState) -> List[str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SUB-AGENT 1: ANALYST WORKER (Parallel Read Tools + Zero Failure Crash)
+# SUB-AGENT 1: ANALYST WORKER (Parallel Read Tools + Sprint Insights)
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def analyst_worker_node(state: SupervisorState, config: RunnableConfig) -> Dict[str, Any]:
     """
-    Analyst Sub-Agent:
-    - Runs tools in PARALLEL via asyncio.gather (standup, tasks, issues, workloads, project timeline).
+    Analyst Sub-Agent (Powered by gpt-5-mini):
+    - Runs tools in PARALLEL via asyncio.gather (standup, tasks, issues, workloads, sprints).
+    - Queries sprint insights specifically when sprint/velocity/milestone context is requested.
     - Normalizes results into non-empty structured Markdown findings.
     - Wrapped in try/except for graceful error reporting.
     """
-    _emit_stream_status(status_text="Analyst worker analyzing project health & tasks in parallel...")
+    _emit_stream_status(status_text="Analyst worker analyzing project health, tasks & sprint data...")
     project_id = state.get("project_id") or ""
     user_id = state.get("user_id") or ""
     messages = state.get("messages", [])
@@ -504,12 +556,14 @@ async def analyst_worker_node(state: SupervisorState, config: RunnableConfig) ->
             "what am i working on", "my status", "for me", "me"
         ])
         has_workload_kw = any(k in user_query for k in ["workload", "team", "members", "who is working", "capacity", "distribution"])
-        is_general_query = not (has_task_kw or has_issue_kw or has_standup_kw or has_workload_kw)
+        has_sprint_kw = any(k in user_query for k in ["sprint", "sprints", "velocity", "burndown", "active sprint", "current sprint", "milestone", "milestones"])
+        is_general_query = not (has_task_kw or has_issue_kw or has_standup_kw or has_workload_kw or has_sprint_kw)
 
         need_tasks = has_task_kw or is_general_query
         need_issues = has_issue_kw or is_general_query
         need_standup = has_standup_kw or is_general_query
         need_workload = has_workload_kw
+        need_sprint = has_sprint_kw or is_general_query
 
         if need_tasks:
             _emit_stream_status(tool_called="get_tasks_summary", caller="Project analyst")
@@ -519,15 +573,18 @@ async def analyst_worker_node(state: SupervisorState, config: RunnableConfig) ->
             _emit_stream_status(tool_called="get_user_standup", caller="Project analyst")
         if need_workload:
             _emit_stream_status(tool_called="get_member_workload", caller="Project analyst")
+        if need_sprint:
+            _emit_stream_status(tool_called="get_sprint_insights", caller="Project analyst")
 
         # Execute read tools in parallel concurrently (only those actually needed)
         tasks_future = fetch_tasks_summary_async(project_id) if need_tasks else asyncio.sleep(0, result=None)
         issues_future = fetch_issues_summary_async(project_id) if need_issues else asyncio.sleep(0, result=None)
         standup_future = fetch_user_standup_async(project_id, user_id) if (need_standup and user_id) else asyncio.sleep(0, result=None)
         workload_future = fetch_member_workload_async(project_id) if need_workload else asyncio.sleep(0, result=None)
+        sprint_future = fetch_sprint_insights_async(project_id) if need_sprint else asyncio.sleep(0, result=None)
 
-        tasks_res, issues_res, standup_res, workload_res = await asyncio.gather(
-            tasks_future, issues_future, standup_future, workload_future, return_exceptions=True
+        tasks_res, issues_res, standup_res, workload_res, sprint_res = await asyncio.gather(
+            tasks_future, issues_future, standup_future, workload_future, sprint_future, return_exceptions=True
         )
 
         # Normalize exceptions if any individual tool failed
@@ -535,6 +592,7 @@ async def analyst_worker_node(state: SupervisorState, config: RunnableConfig) ->
         issues_data = issues_res if not isinstance(issues_res, Exception) else {"error": str(issues_res)}
         standup_data = standup_res if not isinstance(standup_res, Exception) else {"error": str(standup_res)}
         workload_data = workload_res if not isinstance(workload_res, Exception) else {"error": str(workload_res)}
+        sprint_data = sprint_res if not isinstance(sprint_res, Exception) else {"error": str(sprint_res)}
 
         # Build clean structured summary for Kaya Synthesis
         lines = ["### Analyst Sub-Agent Findings:"]
@@ -579,6 +637,33 @@ async def analyst_worker_node(state: SupervisorState, config: RunnableConfig) ->
                         assignees = ", ".join(iss.get("assignees", [])) if isinstance(iss.get("assignees"), list) else "Unassigned"
                         lines.append(f"  • Issue Title: '{title}' | Severity: {sev} | Status: {status} | Assignee: {assignees}")
 
+        # Sprint Insights Section (only when sprint data was requested)
+        if need_sprint and sprint_data is not None:
+            if "error" in sprint_data:
+                lines.append(f"- **Sprint Insights**: ⚠️ {sprint_data['error']}")
+            else:
+                sprints_list = sprint_data.get("sprints", [])
+                active_sprints = [s for s in sprints_list if s.get("status") == "active"]
+                planned_sprints = [s for s in sprints_list if s.get("status") == "planned"]
+                completed_sprints = [s for s in sprints_list if s.get("status") == "completed"]
+                lines.append(
+                    f"- **Sprint Analytics**: Total Sprints: {len(sprints_list)} | "
+                    f"Active: {len(active_sprints)} | Planned (Not Started): {len(planned_sprints)} | Completed: {len(completed_sprints)}"
+                )
+                for s in sprints_list:
+                    s_name = s.get("name", "Sprint")
+                    s_status = s.get("status", "planned")
+                    s_goal = s.get("goal") or "No goal specified"
+                    stats = s.get("stats", {})
+                    progress_pct = stats.get("progressPercent", 0)
+                    duration = s.get("duration", {})
+                    dur_str = f" ({duration.get('start', '')} - {duration.get('end', '')})" if duration else ""
+                    lines.append(
+                        f"  • Sprint '{s_name}' [{s_status.upper()}]{dur_str} | Goal: {s_goal} | "
+                        f"Progress: {progress_pct}% (Completed Tasks: {stats.get('completedTasks', 0)}/{stats.get('totalTasks', 0)}, "
+                        f"Closed Issues: {stats.get('closedIssues', 0)}/{stats.get('totalIssues', 0)})"
+                    )
+
         # Standup Section
         if need_standup and standup_data and "error" not in standup_data:
             user_tasks = standup_data.get("tasks", []) or standup_data.get("assignedTasks", [])
@@ -596,9 +681,26 @@ async def analyst_worker_node(state: SupervisorState, config: RunnableConfig) ->
             for m in members:
                 m_name = m.get("name", "Unknown")
                 m_role = m.get("role", "member")
-                tasks_val = m.get("totalTasks") if m.get("totalTasks") is not None else len(m.get("tasks", [])) if isinstance(m.get("tasks"), list) else m.get("tasks", 0)
-                issues_val = m.get("totalIssues") if m.get("totalIssues") is not None else len(m.get("issues", [])) if isinstance(m.get("issues"), list) else m.get("issues", 0)
-                lines.append(f"  • Member: {m_name} ({m_role}) -> Tasks Assigned: {tasks_val} | Issues: {issues_val}")
+                tasks_val = m.get("activeTasksCount") if m.get("activeTasksCount") is not None else (m.get("totalTasks") or 0)
+                issues_val = m.get("activeIssuesCount") if m.get("activeIssuesCount") is not None else (m.get("totalIssues") or 0)
+                status_note = m.get("statusNote") or m.get("workloadStatus", "balanced")
+                blocked_val = m.get("blockedCount", 0)
+                overdue_val = m.get("overdueCount", 0)
+                
+                status_indicator = "⚖️"
+                if m.get("workloadStatus") == "overloaded":
+                    status_indicator = "🔥 [OVERLOADED]"
+                elif m.get("workloadStatus") == "stale_or_blocked":
+                    status_indicator = "⚠️ [STALE / BLOCKED]"
+                elif m.get("workloadStatus") == "idle":
+                    status_indicator = "💤 [IDLE]"
+                else:
+                    status_indicator = "✅ [BALANCED]"
+                    
+                lines.append(
+                    f"  • {status_indicator} **{m_name}** ({m_role}): Active Tasks: {tasks_val} | Active Issues: {issues_val} "
+                    f"| Blocked: {blocked_val} | Overdue: {overdue_val} — Status: _{status_note}_"
+                )
 
         # Document Analysis Section (if PRD/specification doc is attached or referenced)
         file_id = state.get("file_id")
@@ -622,12 +724,7 @@ async def analyst_worker_node(state: SupervisorState, config: RunnableConfig) ->
                         )),
                         HumanMessage(content=f"Document Filename: {filename}\n\nDocument Content:\n{doc_md[:25000]}\n\nUser Question/Focus: '{user_query}'"),
                     ]
-                    eval_llm = ChatOpenAI(
-                        model=os.getenv("GROQ_ROUTER_MODEL", "openai/gpt-oss-120b"),
-                        openai_api_key=os.getenv("GROQ_API_KEY", ""),
-                        openai_api_base="https://api.groq.com/openai/v1",
-                        temperature=0.1,
-                    )
+                    eval_llm = get_analyst_llm()
                     eval_res = await eval_llm.ainvoke(eval_prompt)
                     lines.append(f"\n### PRD / Document Review & Critical Issues ({filename}):\n{eval_res.content}")
             except Exception as doc_err:
@@ -639,6 +736,7 @@ async def analyst_worker_node(state: SupervisorState, config: RunnableConfig) ->
         return {
             "_analyst_messages": [RESET_SENTINEL, {"role": "analyst", "content": findings_text}],
             "standup_data": standup_data if need_standup else None,
+            "sprint_insights": sprint_data if need_sprint else None,
             "file_id": file_id,
         }
 
@@ -1030,73 +1128,7 @@ async def db_write_worker_node(state: SupervisorState, config: RunnableConfig) -
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SUB-AGENT 3: SPRINT WORKER (Sprint Velocity & Lifecycle Management)
-# ─────────────────────────────────────────────────────────────────────────────
-
-async def sprint_worker_node(state: SupervisorState, config: RunnableConfig) -> Dict[str, Any]:
-    """
-    Sprint Sub-Agent:
-    - Fetches sprint insights, velocity metrics, and timelines concurrently.
-    - Handles sprint creation / task assignment workflows.
-    - Wrapped in try/except for graceful error reporting.
-    """
-    _emit_stream_status(status_text="Sprint worker inspecting sprint velocity & backlog...")
-    project_id = state.get("project_id") or ""
-
-    if not project_id:
-        return {
-            "_sprint_messages": [
-                RESET_SENTINEL,
-                {"role": "sprint", "content": "⚠️ No active project selected. Cannot fetch sprint analytics."},
-            ]
-        }
-
-    try:
-        _emit_stream_status(tool_called="get_sprint_insights", caller="Sprint manager")
-
-        # Fetch sprint insights
-        sprint_data = await fetch_sprint_insights_async(project_id)
-        if isinstance(sprint_data, Exception):
-            sprint_data = {"error": str(sprint_data)}
-
-        lines = ["### Sprint Sub-Agent Findings:"]
-        if "error" in sprint_data:
-            lines.append(f"- **Sprint Insights**: ⚠️ {sprint_data['error']}")
-        else:
-            sprints_list = sprint_data.get("sprints", [])
-            active_sprints = [s for s in sprints_list if s.get("status") == "active"]
-            completed_sprints = [s for s in sprints_list if s.get("status") == "completed"]
-            lines.append(
-                f"- **Sprint Analytics**: Total Sprints: {len(sprints_list)} | "
-                f"Active: {len(active_sprints)} | Completed: {len(completed_sprints)}"
-            )
-            if active_sprints:
-                curr = active_sprints[0]
-                lines.append(f"- **Current Active Sprint**: '{curr.get('name', 'Sprint')}' (Goal: {curr.get('goal', 'N/A')})")
-
-        findings_text = "\n".join(lines)
-
-        return {
-            "_sprint_messages": [RESET_SENTINEL, {"role": "sprint", "content": findings_text}],
-            "sprint_insights": sprint_data,
-        }
-
-    except GraphInterrupt:
-        raise
-    except Exception as e:
-        error_msg = f"Sprint Sub-Agent encountered an error: {e}"
-        print(f"[SPRINT WORKER ERROR] {error_msg}")
-        return {
-            "_sprint_messages": [
-                RESET_SENTINEL,
-                {"role": "sprint", "content": f"⚠️ [Sprint Data Notice]: {error_msg}"},
-            ],
-            "active_error": error_msg,
-        }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SUB-AGENT 4: MCP INTEGRATIONS WORKER (Slack, Calendly, Linear, Notion, Sentry)
+# SUB-AGENT 3: MCP INTEGRATIONS WORKER (Slack, Calendly, Linear, Notion, Sentry)
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def mcp_worker_node(state: SupervisorState, config: RunnableConfig) -> Dict[str, Any]:
@@ -1252,7 +1284,7 @@ YOUR OPERATING PRINCIPLES:
 async def kaya_synthesizer_node(state: SupervisorState, config: RunnableConfig) -> Dict[str, Any]:
     """
     Kaya Synthesizer Node:
-    - Ingests all sub-agent worker outputs (_analyst_messages, _db_write_messages, _sprint_messages, _mcp_messages).
+    - Ingests all sub-agent worker outputs (_analyst_messages, _db_write_messages, _mcp_messages).
     - Injects project details, deadline awareness directly from state, and current date.
     - Synthesizes findings using gpt-4.1-mini, streaming executive PM tokens to user.
     """
@@ -1285,7 +1317,6 @@ async def kaya_synthesizer_node(state: SupervisorState, config: RunnableConfig) 
     for key, label in [
         ("_analyst_messages", "ANALYST FINDINGS"),
         ("_db_write_messages", "DB WRITE ACTIONS"),
-        ("_sprint_messages", "SPRINT FINDINGS"),
         ("_mcp_messages", "THIRD-PARTY MCP INTEGRATION FINDINGS (Sentry, Jira, Vercel, Slack, Linear, Notion, ETC)"),
     ]:
         msgs = state.get(key, [])
@@ -1326,6 +1357,7 @@ YOUR PERSONA & STANDARDS:
      * Vercel: `| Project | Deployment URL | State / Status | Commit / Branch | Target / Environment | Creator | Link |`
      * Internal Project Tasks: `| Task Title | Assignee | Priority | Deadline / Status |`
      * Internal Project Issues: `| Issue Title | Severity | Status | Assignees |`
+     * Internal Sprints: `| Sprint Name | Goal | Status | Progress | Dates |`
    - CLICKABLE LINKS: If URLs, permalinks, inspector URLs, or deployment links are available in the worker data, you MUST include clickable Markdown links (e.g. `[View on Sentry](https://...)` or `[Open Deployment](https://...)`) in the Link column.
    - DO NOT COLLAPSE OR TRUNCATE: List every single issue/item in its own table row. Never use placeholder lines like '| ... and 15 more |'.
    - EXECUTIVE SUMMARY AT END: At the very end of your response, provide an authoritative '### 📊 Executive PM Summary & Next Actions' section containing:
@@ -1362,12 +1394,11 @@ def build_kaya_graph():
     """Builds and compiles the master Kaya multi-agent LangGraph workflow."""
     workflow = StateGraph(SupervisorState)
 
-    # Add Nodes (All 4 Sub-Agents + Direct + Synthesizer)
+    # Add Nodes (3 Sub-Agents + Direct + Synthesizer)
     workflow.add_node("supervisor_router_node", supervisor_router_node)
     workflow.add_node("kaya_direct_node", kaya_direct_node)
     workflow.add_node("analyst_node", analyst_worker_node)
     workflow.add_node("db_write_node", db_write_worker_node)
-    workflow.add_node("sprint_node", sprint_worker_node)
     workflow.add_node("mcp_node", mcp_worker_node)
     workflow.add_node("kaya_synthesizer_node", kaya_synthesizer_node)
 
@@ -1378,16 +1409,15 @@ def build_kaya_graph():
     workflow.add_conditional_edges(
         "supervisor_router_node",
         route_supervisor,
-        ["kaya_direct_node", "analyst_node", "db_write_node", "sprint_node", "mcp_node"],
+        ["kaya_direct_node", "analyst_node", "db_write_node", "mcp_node"],
     )
 
     # Direct Response terminates directly
     workflow.add_edge("kaya_direct_node", END)
 
-    # Fan-In: All 4 Sub-Agent Workers converge into Kaya Synthesizer
+    # Fan-In: All Sub-Agent Workers converge into Kaya Synthesizer
     workflow.add_edge("analyst_node", "kaya_synthesizer_node")
     workflow.add_edge("db_write_node", "kaya_synthesizer_node")
-    workflow.add_edge("sprint_node", "kaya_synthesizer_node")
     workflow.add_edge("mcp_node", "kaya_synthesizer_node")
 
     # Synthesizer terminates at END

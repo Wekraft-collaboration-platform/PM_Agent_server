@@ -203,24 +203,6 @@ def create_calendar_event(
 
 
 @tool
-def create_sprint(
-    project_id: str,
-    sprint_name: str,
-    sprint_goal: str,
-    start_date: str,
-    end_date: str,
-) -> str:
-    """Create a new sprint for the project."""
-    return "intercepted"
-
-
-@tool
-def add_items_to_sprint(sprint_id: str) -> str:
-    """Trigger the item selection UI so the user can pick tasks for the sprint."""
-    return "intercepted"
-
-
-@tool
 def bulk_create_tasks(project_id: str) -> str:
     """Bulk create tasks extracted from uploaded PRDs / documents."""
     return "intercepted"
@@ -243,20 +225,6 @@ async def write_calendar_event_to_convex(payload: dict) -> str:
         return f"✅ Calendar event created: '{payload.get('title')}' (id: {result.get('id', 'unknown')})"
     except Exception as e:
         return f"❌ Failed to create calendar event: {e}"
-
-
-async def write_sprint_to_convex(payload: dict) -> dict:
-    """Actual HTTP call to Convex for sprint creation after HITL approval."""
-    return await convex_post_async("createSprint", payload)
-
-
-async def write_items_to_sprint(sprint_id: str, task_ids: list) -> str:
-    """Actual HTTP call to Convex for adding sprint items after HITL approval."""
-    try:
-        await convex_post_async("addItemsToSprint", {"sprintId": sprint_id, "taskIds": task_ids})
-        return f"✅ Added {len(task_ids)} task(s) to sprint."
-    except Exception as e:
-        return f"❌ Failed to add tasks to sprint: {e}"
 
 
 async def write_bulk_tasks_to_convex(payload: dict) -> str:
@@ -288,22 +256,16 @@ DBWRITE_TOOLS = [
     bulk_create_issues,
 ]
 
-# All Read-Only Analytics & Insights Tools
+# All Read-Only Analytics & Insights Tools (Includes sprint insights)
 ANALYST_TOOLS = [
     get_user_standup,
     get_tasks_summary,
     get_issues_summary,
     get_member_workload,
-]
-
-# Sprint Management Tools
-SPRINT_TOOLS = [
     get_sprint_insights,
-    create_sprint,
-    add_items_to_sprint,
 ]
 
-ALL_TOOLS = DBWRITE_TOOLS + ANALYST_TOOLS + SPRINT_TOOLS
+ALL_TOOLS = DBWRITE_TOOLS + ANALYST_TOOLS
 
 
 # ─────────────────────────────────────────────────────────────────────────────
