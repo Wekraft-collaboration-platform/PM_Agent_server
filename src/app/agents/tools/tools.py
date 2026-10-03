@@ -140,18 +140,6 @@ def get_sprint_insights(project_id: str) -> dict:
         return {"error": str(e)}
 
 
-@tool
-def get_scheduler(project_id: str) -> dict:
-    """Fetch the active automated report scheduler configuration for a project."""
-    print(f"[get_scheduler] querying — project={project_id}")
-    try:
-        data = convex_post_sync("getScheduler", {"projectId": project_id})
-        scheduler = data.get("scheduler")
-        return {"exists": False} if not scheduler else {"exists": True, **scheduler}
-    except Exception as e:
-        print(f"[get_scheduler] ✗ ERROR: {e}")
-        return {"error": str(e)}
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ASYNC PARALLEL FETCHERS (Used by Sub-Agents for concurrent execution)
