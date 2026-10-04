@@ -64,6 +64,8 @@ class SupervisorState(TypedDict):
     _sprint_messages: Annotated[List[Any], reset_or_add]
     _mcp_messages: Annotated[List[Any], reset_or_add]
     _mcp_tool_call_id: Optional[str]
+    _github_messages: Annotated[List[Any], reset_or_add]
+    _github_tool_call_id: Optional[str]
 
     # 5. Shared Context Bus (Semantic Cache, Tool Outputs, Document Attachments)
     retrieved_memory: Optional[List[str]]
@@ -71,6 +73,10 @@ class SupervisorState(TypedDict):
     sprint_insights: Optional[Dict[str, Any]]
     project_insights: Optional[Dict[str, Any]]
     mcp_insights: Optional[Dict[str, Any]]
+    github_insights: Optional[Dict[str, Any]]
+    github_access_token: Optional[str]
+    github_username: Optional[str]
+    repo_full_name: Optional[str]
     file_id: Optional[str]
     attached_document: Optional[Dict[str, Any]]
     active_error: Optional[str]
@@ -109,6 +115,8 @@ class KayaState(MessagesState):
     _sprint_messages: Annotated[List[Any], reset_or_add]
     _mcp_messages: Annotated[List[Any], reset_or_add]
     _mcp_tool_call_id: Optional[str]
+    _github_messages: Annotated[List[Any], reset_or_add]
+    _github_tool_call_id: Optional[str]
 
     # Shared Context & Cache
     retrieved_memory: Optional[List[str]]
@@ -116,6 +124,10 @@ class KayaState(MessagesState):
     sprint_insights: Optional[Dict[str, Any]]
     project_insights: Optional[Dict[str, Any]]
     mcp_insights: Optional[Dict[str, Any]]
+    github_insights: Optional[Dict[str, Any]]
+    github_access_token: Optional[str]
+    github_username: Optional[str]
+    repo_full_name: Optional[str]
     file_id: Optional[str]
     attached_document: Optional[Dict[str, Any]]
     active_error: Optional[str]
@@ -129,5 +141,6 @@ class KayaState(MessagesState):
     # Declarative Skills Integration
     selected_skill: Optional[str]
     active_skill_content: Optional[str]
+
 
 

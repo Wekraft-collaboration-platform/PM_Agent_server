@@ -748,7 +748,7 @@ async def _run_worker_loop(
         connected_repo_name = meta.get("repoName") or ""
         connected_repo_owner = meta.get("repoOwner") or ""
         connected_repo_id = meta.get("repoId") or meta.get("repositoryId") or meta.get("githubId") or ""
-        connected_user = conn.get("userName") or meta.get("userName") or ""
+        connected_user = meta.get("connectedByUserName") or meta.get("userName") or ""
 
         if not connected_repo_owner and "/" in connected_repo_full:
             connected_repo_owner = connected_repo_full.split("/")[0]

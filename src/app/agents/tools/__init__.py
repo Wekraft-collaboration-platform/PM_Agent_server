@@ -15,6 +15,14 @@ from app.agents.tools.tools import (
     write_bulk_issues_to_convex,
     convex_post_async,
     convex_post_sync,
+    fetch_github_pull_requests_async,
+    fetch_github_issues_async,
+    fetch_github_contributor_activity_async,
+    fetch_github_release_and_ci_status_async,
+    get_pull_requests_summary,
+    get_issues,
+    get_contributor_activity,
+    get_release_and_ci_status,
 )
 from app.agents.tools.mcp_client import (
     fetch_project_mcp_connections_async,
@@ -22,15 +30,31 @@ from app.agents.tools.mcp_client import (
     execute_mcp_agent_workflow,
 )
 
+GITHUB_TOOLS = [
+    get_pull_requests_summary,
+    get_issues,
+    get_contributor_activity,
+    get_release_and_ci_status,
+]
+
 __all__ = [
     "ALL_TOOLS",
     "DBWRITE_TOOLS",
     "ANALYST_TOOLS",
+    "GITHUB_TOOLS",
     "get_tasks_summary",
     "get_issues_summary",
     "get_member_workload",
     "get_user_standup",
     "get_sprint_insights",
+    "fetch_github_pull_requests_async",
+    "fetch_github_issues_async",
+    "fetch_github_contributor_activity_async",
+    "fetch_github_release_and_ci_status_async",
+    "get_pull_requests_summary",
+    "get_issues",
+    "get_contributor_activity",
+    "get_release_and_ci_status",
     "create_calendar_event",
     "bulk_create_tasks",
     "bulk_create_issues",
@@ -43,4 +67,5 @@ __all__ = [
     "smart_prune_connectors",
     "execute_mcp_agent_workflow",
 ]
+
 

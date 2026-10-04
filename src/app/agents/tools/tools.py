@@ -1,5 +1,7 @@
 import os
 import httpx
+import asyncio
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List
 from tenacity import retry, stop_after_attempt, wait_exponential
 from langchain_core.tools import tool
@@ -183,6 +185,414 @@ async def fetch_sprint_insights_async(project_id: str) -> dict:
         return {"sprints": data.get("sprints", [])}
     except Exception as e:
         return {"error": f"Sprint insights fetch error: {e}"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GITHUB ASYNC FETCHERS & TOOLS (Direct REST API with Clerk OAuth Token)
+# ─────────────────────────────────────────────────────────────────────────────
+# GITHUB TOOLS (PRs, Issues, Contributor Velocity, Release & CI Health)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def get_github_access_token_async(user_id: str = "") -> str:
+    """Auto-resolves user GitHub OAuth access token directly from Clerk."""
+    clerk_key = os.getenv("CLERK_SECRET_KEY", "").strip()
+    if not clerk_key:
+        try:
+            from pathlib import Path
+            client_env = Path(r"r:\exp_wekraft\client\.env.local")
+            if client_env.exists():
+                for line in client_env.read_text(encoding="utf-8").splitlines():
+                    if line.strip().startswith("CLERK_SECRET_KEY="):
+                        clerk_key = line.split("=", 1)[1].strip().strip('"').strip("'")
+                        break
+        except Exception:
+            pass
+
+    if not clerk_key:
+        return ""
+
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            headers = {"Authorization": f"Bearer {clerk_key}"}
+            if user_id and user_id.startswith("user_"):
+                tok_r = await client.get(
+                    f"https://api.clerk.com/v1/users/{user_id}/oauth_access_tokens/oauth_github",
+                    headers=headers,
+                )
+                if tok_r.status_code == 200:
+                    toks = tok_r.json()
+                    if toks and len(toks) > 0 and toks[0].get("token"):
+                        return toks[0].get("token")
+
+            r = await client.get("https://api.clerk.com/v1/users?limit=20", headers=headers)
+            if r.status_code == 200:
+                for u in r.json():
+                    uid = u.get("id")
+                    tok_r = await client.get(
+                        f"https://api.clerk.com/v1/users/{uid}/oauth_access_tokens/oauth_github",
+                        headers=headers,
+                    )
+                    if tok_r.status_code == 200:
+                        toks = tok_r.json()
+                        if toks and len(toks) > 0 and toks[0].get("token"):
+                            return toks[0].get("token")
+    except Exception as e:
+        print(f"[GITHUB TOOL] Notice: Clerk token lookup: {e}")
+
+    return ""
+
+
+def _get_github_headers(token: str) -> Dict[str, str]:
+    headers = {
+        "Accept": "application/vnd.github.v3+json",
+        "User-Agent": "WeKraft-Kaya-Agent",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+async def fetch_github_pull_requests_async(owner: str, repo: str, token: str = "") -> dict:
+    """Fetch pull requests summary: open PRs, stale PRs (>48h), draft PRs, and merged PRs."""
+    if not token:
+        token = await get_github_access_token_async()
+
+    if not owner or not repo:
+        return {"error": "Missing repository owner or repo name."}
+    if not token:
+        return {"error": "GitHub is not linked or unauthorized. Please connect your GitHub account."}
+    
+    url = f"https://api.github.com/repos/{owner}/{repo}/pulls?state=all&sort=updated&direction=desc&per_page=30"
+    headers = _get_github_headers(token)
+
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            resp = await client.get(url, headers=headers)
+            if resp.status_code != 200:
+                return {"error": f"GitHub API error ({resp.status_code}): {resp.text}"}
+            pulls = resp.json()
+
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        open_prs = []
+        stale_prs = []
+        merged_prs = []
+
+        for p in pulls:
+            state = p.get("state", "open")
+            is_draft = p.get("draft", False)
+            created_str = p.get("created_at") or ""
+            updated_str = p.get("updated_at") or ""
+            merged_at_str = p.get("merged_at")
+
+            is_stale = False
+            if state == "open" and updated_str:
+                try:
+                    updated_dt = datetime.fromisoformat(updated_str.replace("Z", "+00:00")).replace(tzinfo=None)
+                    diff_hours = (now - updated_dt).total_seconds() / 3600.0
+                    if diff_hours > 48.0:
+                        is_stale = True
+                except Exception:
+                    pass
+
+            pr_item = {
+                "number": p.get("number"),
+                "title": p.get("title"),
+                "author": p.get("user", {}).get("login", "unknown"),
+                "state": state,
+                "draft": is_draft,
+                "is_stale": is_stale,
+                "created_at": created_str,
+                "updated_at": updated_str,
+                "head_branch": p.get("head", {}).get("ref", ""),
+                "base_branch": p.get("base", {}).get("ref", ""),
+                "html_url": p.get("html_url", ""),
+                "requested_reviewers": [r.get("login") for r in p.get("requested_reviewers", []) if r.get("login")],
+            }
+
+            if state == "open":
+                open_prs.append(pr_item)
+                if is_stale:
+                    stale_prs.append(pr_item)
+            elif merged_at_str or state == "closed":
+                merged_prs.append({
+                    "number": p.get("number"),
+                    "title": p.get("title"),
+                    "author": p.get("user", {}).get("login", "unknown"),
+                    "merged_at": merged_at_str or updated_str,
+                    "html_url": p.get("html_url", ""),
+                })
+
+        return {
+            "total_tracked": len(pulls),
+            "open_count": len(open_prs),
+            "stale_count": len(stale_prs),
+            "merged_count": len(merged_prs),
+            "open_prs": open_prs,
+            "stale_prs": stale_prs,
+            "recent_merged_prs": merged_prs[:5],
+        }
+    except Exception as e:
+        return {"error": f"Failed to fetch pull requests: {e}"}
+
+
+async def fetch_github_issues_async(owner: str, repo: str, token: str = "", state: str = "all") -> dict:
+    """Fetch repository issues summary (excluding PRs), identifying unassigned and blocker bugs."""
+    if not token:
+        token = await get_github_access_token_async()
+
+    if not owner or not repo:
+        return {"error": "Missing repository owner or repo name."}
+    if not token:
+        return {"error": "GitHub is not linked or unauthorized. Please connect your GitHub account."}
+
+    url = f"https://api.github.com/repos/{owner}/{repo}/issues?state={state}&sort=updated&direction=desc&per_page=30"
+    headers = _get_github_headers(token)
+
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            resp = await client.get(url, headers=headers)
+            if resp.status_code != 200:
+                return {"error": f"GitHub API error ({resp.status_code}): {resp.text}"}
+            raw_items = resp.json()
+
+        issues = []
+        open_issues = []
+        closed_issues = []
+        unassigned_issues = []
+        blocker_issues = []
+
+        for item in raw_items:
+            # Filter out pull requests
+            if item.get("pull_request"):
+                continue
+
+            labels = [lbl.get("name", "") if isinstance(lbl, dict) else str(lbl) for lbl in item.get("labels", [])]
+            assignees = [a.get("login", "") for a in item.get("assignees", []) if a.get("login")]
+            if not assignees and item.get("assignee"):
+                assignees = [item["assignee"].get("login", "")]
+
+            is_unassigned = len(assignees) == 0
+            is_blocker = any(any(k in lbl.lower() for k in ["bug", "critical", "blocker", "urgent", "p0", "high"]) for lbl in labels)
+
+            iss_data = {
+                "number": item.get("number"),
+                "title": item.get("title"),
+                "state": item.get("state", "open"),
+                "author": item.get("user", {}).get("login", "unknown"),
+                "assignees": assignees,
+                "is_unassigned": is_unassigned,
+                "is_blocker": is_blocker,
+                "labels": labels,
+                "comments_count": item.get("comments", 0),
+                "created_at": item.get("created_at"),
+                "updated_at": item.get("updated_at"),
+                "html_url": item.get("html_url", ""),
+            }
+
+            issues.append(iss_data)
+            if iss_data["state"] == "open":
+                open_issues.append(iss_data)
+                if is_unassigned:
+                    unassigned_issues.append(iss_data)
+                if is_blocker:
+                    blocker_issues.append(iss_data)
+            else:
+                closed_issues.append(iss_data)
+
+        return {
+            "total_count": len(issues),
+            "open_count": len(open_issues),
+            "closed_count": len(closed_issues),
+            "unassigned_count": len(unassigned_issues),
+            "blocker_count": len(blocker_issues),
+            "open_issues": open_issues,
+            "unassigned_issues": unassigned_issues,
+            "blocker_issues": blocker_issues,
+        }
+    except Exception as e:
+        return {"error": f"Failed to fetch issues: {e}"}
+
+
+async def fetch_github_contributor_activity_async(owner: str, repo: str, token: str = "", days: int = 14) -> dict:
+    """Fetch team commit frequency, active contributors, and recent commits."""
+    if not token:
+        token = await get_github_access_token_async()
+
+    if not owner or not repo:
+        return {"error": "Missing repository owner or repo name."}
+    if not token:
+        return {"error": "GitHub is not linked or unauthorized. Please connect your GitHub account."}
+
+    seven_days_ago = (datetime.now(timezone.utc) - timedelta(days=7)).replace(tzinfo=None)
+    timeframe_ago = (datetime.now(timezone.utc) - timedelta(days=days)).replace(tzinfo=None)
+
+    url = f"https://api.github.com/repos/{owner}/{repo}/commits?per_page=50"
+    headers = _get_github_headers(token)
+
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            resp = await client.get(url, headers=headers)
+            if resp.status_code != 200:
+                return {"error": f"GitHub API error ({resp.status_code}): {resp.text}"}
+            commits = resp.json()
+
+        author_map: Dict[str, Dict[str, Any]] = {}
+        commits_last_7_days = 0
+        commits_in_timeframe = 0
+
+        for c in commits:
+            author_info = c.get("author") or {}
+            commit_info = c.get("commit", {}).get("author", {}) or {}
+
+            author_login = author_info.get("login") or commit_info.get("name") or "unknown"
+            author_name = commit_info.get("name") or author_login
+            avatar_url = author_info.get("avatar_url") or ""
+            date_str = commit_info.get("date") or ""
+
+            if date_str:
+                try:
+                    c_dt = datetime.fromisoformat(date_str.replace("Z", "+00:00")).replace(tzinfo=None)
+                    if c_dt >= seven_days_ago:
+                        commits_last_7_days += 1
+                    if c_dt >= timeframe_ago:
+                        commits_in_timeframe += 1
+                except Exception:
+                    pass
+
+            if author_login not in author_map:
+                author_map[author_login] = {
+                    "login": author_login,
+                    "name": author_name or author_login,
+                    "avatar_url": avatar_url,
+                    "commit_count": 0,
+                    "last_commit_date": date_str,
+                }
+            author_map[author_login]["commit_count"] += 1
+
+        top_contributors = sorted(author_map.values(), key=lambda x: x["commit_count"], reverse=True)
+
+        recent_commits = []
+        for c in commits[:10]:
+            commit_author = c.get("author", {}).get("login") if c.get("author") else c.get("commit", {}).get("author", {}).get("name", "unknown")
+            msg = c.get("commit", {}).get("message", "").split("\n")[0]
+            recent_commits.append({
+                "sha": (c.get("sha") or "")[:7],
+                "message": msg,
+                "author": commit_author,
+                "date": c.get("commit", {}).get("author", {}).get("date", ""),
+                "html_url": c.get("html_url", ""),
+            })
+
+        return {
+            "timeframe_days": days,
+            "total_commits": len(commits),
+            "commits_last_7_days": commits_last_7_days,
+            "commits_in_timeframe": commits_in_timeframe,
+            "active_contributors_count": len(top_contributors),
+            "top_contributors": top_contributors,
+            "recent_commits": recent_commits,
+        }
+    except Exception as e:
+        return {"error": f"Failed to fetch contributor activity: {e}"}
+
+
+async def fetch_github_release_and_ci_status_async(owner: str, repo: str, token: str = "") -> dict:
+    """Fetch latest release tags and recent GitHub Actions CI workflow run health."""
+    if not token:
+        token = await get_github_access_token_async()
+
+    if not owner or not repo:
+        return {"error": "Missing repository owner or repo name."}
+    if not token:
+        return {"error": "GitHub is not linked or unauthorized. Please connect your GitHub account."}
+
+    rel_url = f"https://api.github.com/repos/{owner}/{repo}/releases?per_page=5"
+    runs_url = f"https://api.github.com/repos/{owner}/{repo}/actions/runs?per_page=10"
+    headers = _get_github_headers(token)
+
+    releases = []
+    workflow_runs = []
+
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            rel_task = client.get(rel_url, headers=headers)
+            runs_task = client.get(runs_url, headers=headers)
+            rel_resp, runs_resp = await asyncio.gather(rel_task, runs_task, return_exceptions=True)
+
+            if not isinstance(rel_resp, Exception) and rel_resp.status_code == 200:
+                for r in rel_resp.json():
+                    releases.append({
+                        "id": r.get("id"),
+                        "tag_name": r.get("tag_name"),
+                        "name": r.get("name") or r.get("tag_name"),
+                        "published_at": r.get("published_at"),
+                        "prerelease": r.get("prerelease", False),
+                        "html_url": r.get("html_url", ""),
+                    })
+
+            if not isinstance(runs_resp, Exception) and runs_resp.status_code == 200:
+                for w in runs_resp.json().get("workflow_runs", []):
+                    workflow_runs.append({
+                        "id": w.get("id"),
+                        "name": w.get("name") or "CI Workflow",
+                        "head_branch": w.get("head_branch"),
+                        "status": w.get("status"),  # completed, in_progress, queued
+                        "conclusion": w.get("conclusion"),  # success, failure, cancelled
+                        "created_at": w.get("created_at"),
+                        "html_url": w.get("html_url", ""),
+                    })
+
+        passing = sum(1 for w in workflow_runs if w.get("conclusion") == "success")
+        failing = sum(1 for w in workflow_runs if w.get("conclusion") in ["failure", "timed_out"])
+        in_progress = sum(1 for w in workflow_runs if w.get("status") in ["in_progress", "queued"])
+
+        return {
+            "latest_release": releases[0] if releases else None,
+            "releases": releases,
+            "recent_workflow_runs": workflow_runs,
+            "ci_health": {
+                "total_tracked": len(workflow_runs),
+                "passing_runs": passing,
+                "failing_runs": failing,
+                "in_progress_runs": in_progress,
+                "is_healthy": failing == 0,
+            },
+        }
+    except Exception as e:
+        return {"error": f"Failed to fetch release and CI status: {e}"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GITHUB LANGCHAIN @tool DESCRIPTORS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@tool
+def get_pull_requests_summary(owner: str, repo: str, token: str = "") -> dict:
+    """Fetch GitHub PR review status, stale PRs (>48h), draft PRs, and merged PRs for the project repo."""
+    import asyncio
+    return asyncio.run(fetch_github_pull_requests_async(owner, repo, token))
+
+
+@tool
+def get_issues(owner: str, repo: str, token: str = "") -> dict:
+    """Fetch GitHub issues summary (open, closed, unassigned, and blocker bugs)."""
+    import asyncio
+    return asyncio.run(fetch_github_issues_async(owner, repo, token))
+
+
+@tool
+def get_contributor_activity(owner: str, repo: str, token: str = "", days: int = 14) -> dict:
+    """Fetch developer velocity, commit trends over last 7/14 days, and active team contributors."""
+    import asyncio
+    return asyncio.run(fetch_github_contributor_activity_async(owner, repo, token, days=days))
+
+
+@tool
+def get_release_and_ci_status(owner: str, repo: str, token: str = "") -> dict:
+    """Fetch latest GitHub release tags and GitHub Actions CI/CD workflow health."""
+    import asyncio
+    return asyncio.run(fetch_github_release_and_ci_status_async(owner, repo, token))
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────

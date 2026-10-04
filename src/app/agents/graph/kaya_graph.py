@@ -48,11 +48,18 @@ from app.agents.tools.tools import (
     fetch_member_workload_async,
     fetch_sprint_insights_async,
     fetch_active_skills_async,
+    fetch_github_pull_requests_async,
+    fetch_github_issues_async,
+    fetch_github_contributor_activity_async,
+    fetch_github_release_and_ci_status_async,
     write_calendar_event_to_convex,
     write_bulk_tasks_to_convex,
     write_bulk_issues_to_convex,
 )
-from app.agents.tools.mcp_client import execute_mcp_agent_workflow
+from app.agents.tools.mcp_client import (
+    execute_mcp_agent_workflow,
+    fetch_project_mcp_connections_async,
+)
 from app.core.utils.document_parser import get_parsed_document_from_cache
 
 load_dotenv(override=True)
@@ -67,6 +74,7 @@ class SupervisorDecision(BaseModel):
     actions: List[str] = Field(
         description=(
             "List of sub-agent actions to trigger in parallel (select ONLY the sub-agents explicitly required):\n"
+            "- 'github': Dedicated GitHub sub-agent for repository analysis: pull requests (stale PRs, reviews, blockers), GitHub issues, contributor velocity (commit trends), and GitHub release/CI build health.\n"
             "- 'mcp': ONLY for third-party external integrations (explicitly requested Jira, Linear, Slack, Calendly, Notion, Sentry, Vercel, MCP). NEVER call for internal project tasks/issues/sprints or if user hasn't asked for third party.\n"
             "- 'db_write': DB Write agent for creating tasks, issues, or calendar events in this project\n"
             "- 'analyst': Project Analyst agent for all internal read analytics: user daily standup, task summaries, issue tracking, member workloads, sprint insights/velocity, project health, deadlines\n"
@@ -83,7 +91,7 @@ class SupervisorDecision(BaseModel):
     reasoning: str = Field(description="Clear reasoning for the sub-agent and skill routing choice.")
 
 
-ROUTER_SYSTEM_PROMPT = """You are the Master Supervisor Router for the WEKRAFT AI Platform.
+ROUTER_SYSTEM_PROMPT = """You are the Supervisor Router for the WEKRAFT AI Platform.
 Analyze the user's incoming query (and previous query context if provided) and make two decisions:
 1. Select the exact sub-agents required ('actions').
 2. Select the SINGLE most appropriate procedural skill ('selected_skill') from the Available Skills Catalog, or null if none match.
@@ -91,31 +99,36 @@ Analyze the user's incoming query (and previous query context if provided) and m
 CRITICAL RULES:
 1. CREATING / IMPORTING TASKS, ISSUES, EVENTS IN THIS PROJECT:
    - When the user asks to create, add, insert, generate, or bring in tasks/issues (e.g., 'okay bring those task in, i want to create those task u said', 'create 3 issues for these errors', 'create tasks', 'schedule meeting', 'add those tasks into our project'), it targets this project's internal database -> route to 'db_write' (DB Write Agent) ONLY.
-   - For follow-up task creation/importing commands ('bring those tasks in', 'create those tasks you said', 'add them to my project'): Select ONLY ['db_write'] and set selected_skill to null. NEVER re-invoke 'mcp' or 'analyst' for pure creation follow-ups.
-   - NEVER call 'mcp' for creating internal project tasks even if the tasks originated from Jira, Linear, or Sentry findings.
+   - For follow-up task creation/importing commands ('bring those tasks in', 'create those tasks you said', 'add them to my project'): Select ONLY ['db_write'] and set selected_skill to null. NEVER re-invoke 'mcp', 'github', or 'analyst' for pure creation follow-ups.
 
-2. THIRD-PARTY / MCP AGENT ('mcp'):
-   - ONLY call 'mcp' if the user EXPLICITLY asks to query or mutate a connected third-party SaaS service (Jira, Linear, Slack, Calendly, Notion, Sentry, Vercel, HubSpot, GitHub, Supabase, Stripe, PostHog, MCP).
-   - PHONETIC & TYPO TOLERANCE: Treat common phonetic variations or typos of SaaS names as the intended integration (e.g., 'Zira'/'Jra'/'Atlassian' -> Jira, 'Linar' -> Linear, 'Slak' -> Slack, 'Gaya' -> Kaya).
-   - NEVER call 'mcp' for general coding jargon or project terms like "repository", "codebase", "branch", "commit", "prs", "tasks", "issues", "standup", "sprint", or "bugs" unless an external service is explicitly named.
+2. GITHUB SUB-AGENT ('github'):
+   - ONLY call 'github' when the user explicitly asks about repository code, pull requests (PRs, reviews, stale PRs), commits, developer velocity / contributor activity, or GitHub Actions CI/CD workflows and releases.
+   - NEVER call 'github' for general internal project questions like "what are issues in my project", "what tasks do we have", "my standup", or "sprint status" unless they explicitly ask for GitHub/PR/commits.
+
+3. THIRD-PARTY / MCP AGENT ('mcp'):
+   - ONLY call 'mcp' if the user EXPLICITLY asks to query or mutate a connected third-party SaaS service (Jira, Linear, Slack, Calendly, Notion, Sentry, Vercel, HubSpot, Supabase, Stripe, PostHog, MCP).
+   - PHONETIC & TYPO TOLERANCE: Treat common phonetic variations or typos of SaaS names as the intended integration (e.g., 'Zira'/'Jra'/'Atlassian' -> Jira, 'Linar' -> Linear, 'Slak' -> Slack).
    - NEGATION RESPECT: If the user says "without Jira", "don't check Sentry", "skip Slack", or "no external tools", do NOT include 'mcp'.
 
-3. ANALYST AGENT ('analyst'):
-   - Call 'analyst' for ALL internal project analytics: task summaries, active bugs/issues, daily standups, member workload distribution, sprint progress & velocity, project health, deadlines, and PRD reviews.
+4. ANALYST AGENT ('analyst'):
+   - Call 'analyst' for ALL internal project analytics: "what are issues in my project", task summaries, active bugs/issues in Convex, daily standups, member workload distribution, sprint progress & velocity, project health, deadlines, and PRD reviews.
 
-4. MINIMAL SUB-AGENT CALLS:
+5. MINIMAL SUB-AGENT CALLS:
    - Route ONLY to the exact sub-agents necessary. If it's a simple greeting or general PM question with no database access needed, route to 'direct_response'.
 
-5. PROCEDURAL SKILL SELECTION:
-   - Select the purest atomic skill that matches the exact connectors requested by the user. If none apply, set selected_skill to null.
-
 FEW-SHOT ROUTING EXAMPLES:
-- Query: "okay bring those task in , i want to create those task u said !"
-  -> actions: ["db_write"], selected_skill: null, reasoning: "User confirms creation of previously discussed tasks into internal project database; route to db_write only."
-- Query: "What tasks are blocked in our repository?"
-  -> actions: ["analyst"], selected_skill: null, reasoning: "Internal project task summary; 'repository' refers to internal codebase, no external tools requested."
-- Query: "Summarize our sprint velocity and workload without touching Jira"
-  -> actions: ["analyst"], selected_skill: null, reasoning: "Internal sprint and workload analytics requested; user explicitly excluded Jira so MCP is omitted."
+- Query: "what are issues in my project"
+  -> actions: ["analyst"], selected_skill: null, reasoning: "User is asking for internal project issues in Convex database; route to analyst only."
+- Query: "what are my issues"
+  -> actions: ["analyst"], selected_skill: null, reasoning: "User is asking for their assigned internal work items; route to analyst only."
+- Query: "What PRs are currently open or stale in our repository?"
+  -> actions: ["github"], selected_skill: null, reasoning: "User is asking for repository pull request review status and stale PR analysis."
+- Query: "Show me developer velocity and top contributors this week"
+  -> actions: ["github"], selected_skill: null, reasoning: "User is requesting contributor commit velocity and team code activity."
+- Query: "Did our latest CI workflow build pass on GitHub?"
+  -> actions: ["github"], selected_skill: null, reasoning: "User is asking about GitHub Actions CI/CD workflow status."
+- Query: "What tasks are blocked in our project?"
+  -> actions: ["analyst"], selected_skill: null, reasoning: "Internal project task summary; route to analyst."
 - Query: "Fetch the latest unresolved crashes from Sentry and list open Linear tickets"
   -> actions: ["mcp"], selected_skill: "incident_escalation_triage", reasoning: "External Sentry and Linear telemetry explicitly requested."
 - Query: "Create 4 tasks for the Stripe webhook refactor"
@@ -124,13 +137,15 @@ FEW-SHOT ROUTING EXAMPLES:
   -> actions: ["direct_response"], selected_skill: null, reasoning: "Casual greeting requiring no tool or database execution."
 
 Available Sub-Agents:
-1. 'mcp': Third-party SaaS integrations ONLY (Jira, Linear, Slack, Calendly, Notion, Sentry, HubSpot, Vercel, GitHub).
-2. 'db_write': DB Write agent for project mutations: internal task creation, issue creation, calendar event scheduling.
-3. 'analyst': Project Analyst agent for all internal read-only analytics: daily standup, tasks, issues, workloads, sprint insights/velocity, project health, deadlines.
-4. 'direct_response': Greetings, casual conversation, general PM advice without database queries.
+1. 'github': Dedicated GitHub agent for repository analytics (PRs, stale PRs, GitHub issues, contributor velocity, releases & CI/CD health).
+2. 'mcp': Third-party SaaS integrations ONLY (Jira, Linear, Slack, Calendly, Notion, Sentry, HubSpot, Vercel).
+3. 'db_write': DB Write agent for project mutations: internal task creation, issue creation, calendar event scheduling.
+4. 'analyst': Project Analyst agent for all internal read-only analytics: daily standup, tasks, issues, workloads, sprint insights/velocity, project health, deadlines.
+5. 'direct_response': Greetings, casual conversation, general PM advice without database queries.
 
 Available Skills Catalog (Level 1 Metadata):
 {SKILLS_CATALOG_BLOCK}
+
 """
 
 
@@ -142,7 +157,6 @@ APP_ALIASES: Dict[str, Set[str]] = {
     "calendly": {"calendly", "calendy", "calenderly", "calendli"},
     "notion": {"notion", "notn", "notio", "notion-app"},
     "sentry": {"sentry", "sentri", "sntery", "sentry-io"},
-    "github": {"github", "gthub", "git-hub", "gh", "git"},
     "vercel": {"vercel", "vercl", "varcel"},
     "supabase": {"supabase", "superbase"},
     "neon": {"neon", "neondb"},
@@ -219,6 +233,19 @@ def resolve_skill_selection(
     return None, None
 
 
+def contains_exact_words(text: str, patterns: List[str]) -> bool:
+    """Matches whole words or phrases in text using word boundaries (avoids 'pr' matching 'project')."""
+    lower = text.lower()
+    for item in patterns:
+        if " " in item:
+            if item in lower:
+                return True
+        else:
+            if re.search(r'\b' + re.escape(item) + r'\b', lower):
+                return True
+    return False
+
+
 NEGATION_PREFIXES = ("without", "don't", "dont", "do not", "skip", "ignore", "exclude", "no ", "never ")
 
 
@@ -278,16 +305,31 @@ def _sanitize_and_guard_decision(
             decision.actions.append("mcp")
             decision.reasoning += f" (MCP auto-included for {mentioned_apps})"
 
-    # 5. Sprint & Analytics Keyword Safety Clamp
-    analytics_keywords = ["sprint", "sprints", "velocity", "burndown", "task", "tasks", "issue", "issues", "standup", "workload", "health", "project"]
-    if any(k in lower_latest for k in analytics_keywords) and "analyst" not in decision.actions and "db_write" not in decision.actions:
+    # 5. Deterministic GitHub Keyword Safety Clamp (Strict Word Boundaries to avoid 'pr' in 'project')
+    github_patterns = [
+        "github", "pr", "prs", "pull request", "pull requests", "stale pr", "stale prs",
+        "commit", "commits", "contributor", "contributors", "developer velocity",
+        "ci status", "workflow run", "workflow runs", "build health", "github issue",
+        "github issues", "github release", "git merge", "merge conflict", "codebase activity"
+    ]
+    is_github_intent = contains_exact_words(lower_latest, github_patterns)
+    if is_github_intent and "github" not in decision.actions:
+        if "direct_response" in decision.actions:
+            decision.actions.remove("direct_response")
+        decision.actions.append("github")
+
+    # 6. Sprint & Analytics Keyword Safety Clamp (Skip if pure GitHub query)
+    analytics_keywords = ["sprint", "sprints", "burndown", "task", "tasks", "standup", "workload", "health", "project", "timeline"]
+    has_analyst_terms = any(k in lower_latest for k in analytics_keywords) or (("issue" in lower_latest or "issues" in lower_latest) and not is_github_intent)
+    if has_analyst_terms and "analyst" not in decision.actions and "db_write" not in decision.actions:
         if "direct_response" in decision.actions:
             decision.actions.remove("direct_response")
         decision.actions.append("analyst")
 
-    # 6. Clean up direct_response if actionable subagents exist
+    # 7. Clean up direct_response if actionable subagents exist
     if len(decision.actions) > 1 and "direct_response" in decision.actions:
         decision.actions.remove("direct_response")
+
 
     # Ensure actions is never empty
     if not decision.actions:
@@ -468,10 +510,29 @@ def get_analyst_llm() -> ChatOpenAI:
             "openai_api_key": openai_key,
             "temperature": 0.1,
         }
-        # For OpenAI reasoning models (gpt-5-mini / o-series), set reasoning effort to low for fastest response latency
         if any(m in analyst_model.lower() for m in ["gpt-5", "o1", "o3", "o4"]):
             kwargs["model_kwargs"] = {"reasoning_effort": "low"}
         return ChatOpenAI(**kwargs)
+    groq_key = os.getenv("GROQ_API_KEY", "").strip()
+    return ChatOpenAI(
+        model=os.getenv("GROQ_ROUTER_MODEL", "openai/gpt-oss-120b"),
+        openai_api_key=groq_key or "none",
+        openai_api_base="https://api.groq.com/openai/v1",
+        temperature=0.1,
+    )
+
+
+def get_github_llm() -> ChatOpenAI:
+
+    """Returns model for GitHub Sub-Agent worker (gpt-4.1-mini)."""
+    github_model = os.getenv("GITHUB_MODEL", "gpt-4.1-mini")
+    openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if openai_key:
+        return ChatOpenAI(
+            model=github_model,
+            openai_api_key=openai_key,
+            temperature=0.1,
+        )
     groq_key = os.getenv("GROQ_API_KEY", "").strip()
     return ChatOpenAI(
         model=os.getenv("GROQ_ROUTER_MODEL", "openai/gpt-oss-120b"),
@@ -518,6 +579,8 @@ async def supervisor_router_node(state: SupervisorState, config: RunnableConfig)
             _emit_stream_status(subagent_called="db_write_agent")
         elif action == "mcp":
             _emit_stream_status(subagent_called="mcp_agent")
+        elif action == "github":
+            _emit_stream_status(subagent_called="github_agent")
 
     return {
         "next": decision.actions,
@@ -544,6 +607,8 @@ def route_supervisor(state: SupervisorState) -> List[str]:
         target_nodes.append("db_write_node")
     if "mcp" in actions:
         target_nodes.append("mcp_node")
+    if "github" in actions:
+        target_nodes.append("github_node")
 
     return target_nodes if target_nodes else ["kaya_direct_node"]
 
@@ -1245,6 +1310,226 @@ async def mcp_worker_node(state: SupervisorState, config: RunnableConfig) -> Dic
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SUB-AGENT 4: GITHUB WORKER (PRs, Issues, Contributor Velocity, Release & CI Health)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def resolve_project_github_context(state: SupervisorState) -> Tuple[str, str, str, str]:
+    """
+    Resolves (owner, repo, token, username) for the active project.
+    """
+    token = state.get("github_access_token") or ""
+    repo_full = state.get("repo_full_name") or ""
+    username = state.get("github_username") or ""
+
+    if not repo_full:
+        repo_full = os.getenv("GITHUB_REPO", "").strip()
+
+    owner, repo = "", ""
+    if repo_full and "/" in repo_full:
+        parts = repo_full.split("/", 1)
+        owner, repo = parts[0].strip(), parts[1].strip()
+
+    return owner, repo, token, username
+
+
+async def github_worker_node(state: SupervisorState, config: RunnableConfig) -> Dict[str, Any]:
+    """
+    GitHub Sub-Agent (Powered by gpt-4.1-mini):
+    - Strictly bound to the project's connected repository (owner/repo).
+    - Determines and executes exactly the needed tools from:
+        1. get_pull_requests_summary: PR review status, stale PRs (>48h), draft PRs, and blockers.
+        2. get_issues: Open/closed issues, unassigned bugs, and blocker labels (excluding PRs).
+        3. get_contributor_activity: Developer velocity, 7d vs 14d commit trends, and active contributors.
+        4. get_release_and_ci_status: Release tags, milestones, and GitHub Actions CI workflow runs.
+    - Runs tools in PARALLEL via asyncio.gather.
+    - Formats findings into structured Markdown tables with item counts and clickable links.
+    """
+    _emit_stream_status(status_text="GitHub sub-agent is analyzing repository activity & PR health...")
+    messages = state.get("messages", [])
+    user_query = _get_latest_user_text(messages).lower()
+
+    owner, repo, token, username = await resolve_project_github_context(state)
+
+    if not owner or not repo:
+        notice = (
+            "ℹ️ **No GitHub Repository Linked**: No GitHub repository is connected to this project, "
+            "or GitHub is not linked in your profile. Please link a repository in **Project Settings** "
+            "to view Pull Requests, Issues, Contributor Velocity, and CI/CD Build Health."
+        )
+        return {
+            "_github_messages": [RESET_SENTINEL, {"role": "github", "content": notice}],
+            "github_insights": {"status": "not_connected", "message": notice},
+        }
+
+    # Determine tool requirements based on user query (strict whole-word matching)
+    has_pr_kw = contains_exact_words(user_query, ["pr", "prs", "pull request", "pull requests", "code review", "stale pr", "stale prs", "merge", "branch", "branches"])
+    has_issue_kw = contains_exact_words(user_query, ["github issue", "github issues", "github bug", "github bugs", "unassigned issue", "unassigned bug"]) or ("github" in user_query and any(k in user_query for k in ["issue", "issues", "bug", "bugs"]))
+    has_contrib_kw = contains_exact_words(user_query, ["contributor", "contributors", "velocity", "commit", "commits", "author", "activity", "churn", "who is working", "code activity"])
+    has_ci_kw = contains_exact_words(user_query, ["ci", "build", "workflow", "action", "actions", "run", "runs", "release", "releases", "tag", "tags", "pipeline"])
+    is_general_query = not (has_pr_kw or has_issue_kw or has_contrib_kw or has_ci_kw)
+
+    need_prs = has_pr_kw or is_general_query
+    need_issues = has_issue_kw or is_general_query
+    need_contrib = has_contrib_kw or is_general_query
+    need_ci = has_ci_kw or is_general_query
+
+
+    reasoning_parts = []
+    if need_prs:
+        reasoning_parts.append("pull requests & review bottlenecks")
+    if need_issues:
+        reasoning_parts.append("repository open & unassigned issues")
+    if need_contrib:
+        reasoning_parts.append("contributor commit velocity & recent code activity")
+    if need_ci:
+        reasoning_parts.append("release milestones & CI/CD workflow health")
+
+    gh_reasoning = f"Querying repository '{owner}/{repo}' for {', '.join(reasoning_parts)}."
+    _emit_stream_status(status_text=f"Inspecting '{owner}/{repo}'...", reasoning=gh_reasoning)
+
+    if need_prs:
+        _emit_stream_status(tool_called="get_pull_requests_summary", caller="GitHub sub-agent")
+    if need_issues:
+        _emit_stream_status(tool_called="get_issues", caller="GitHub sub-agent")
+    if need_contrib:
+        _emit_stream_status(tool_called="get_contributor_activity", caller="GitHub sub-agent")
+    if need_ci:
+        _emit_stream_status(tool_called="get_release_and_ci_status", caller="GitHub sub-agent")
+
+    tasks = []
+    task_keys = []
+
+    if need_prs:
+        tasks.append(fetch_github_pull_requests_async(owner, repo, token))
+        task_keys.append("prs")
+    if need_issues:
+        tasks.append(fetch_github_issues_async(owner, repo, token))
+        task_keys.append("issues")
+    if need_contrib:
+        tasks.append(fetch_github_contributor_activity_async(owner, repo, token, days=14))
+        task_keys.append("contributors")
+    if need_ci:
+        tasks.append(fetch_github_release_and_ci_status_async(owner, repo, token))
+        task_keys.append("release_ci")
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    raw_res = dict(zip(task_keys, results))
+
+    lines = [f"## 🐙 GitHub Repository Findings: `{owner}/{repo}`\n"]
+
+    # 1. Pull Requests Section
+    prs_data = raw_res.get("prs")
+    if isinstance(prs_data, dict) and not prs_data.get("error"):
+        open_prs = prs_data.get("open_prs", [])
+        stale_prs = prs_data.get("stale_prs", [])
+        merged_prs = prs_data.get("recent_merged_prs", [])
+
+        lines.append(f"### 🔀 Pull Requests (Total Open: {len(open_prs)} | Stale >48h: {len(stale_prs)})")
+        if open_prs:
+            lines.append("| # | PR Title | Author | State | Draft | Stale (>48h) | Branches | Reviewers | Link |")
+            lines.append("| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |")
+            for p in open_prs:
+                stale_badge = "⚠️ **Yes (>48h)**" if p.get("is_stale") else "No"
+                draft_badge = "Draft" if p.get("draft") else "Ready"
+                branches = f"`{p.get('head_branch', '')}` → `{p.get('base_branch', '')}`"
+                revs = ", ".join(f"@{r}" for r in p.get("requested_reviewers", [])) or "None"
+                link = f"[PR #{p.get('number')}]({p.get('html_url')})" if p.get("html_url") else f"#{p.get('number')}"
+                lines.append(f"| **#{p.get('number')}** | {p.get('title')} | @{p.get('author')} | `{p.get('state')}` | {draft_badge} | {stale_badge} | {branches} | {revs} | {link} |")
+        else:
+            lines.append("No active open pull requests found.")
+
+        if merged_prs:
+            lines.append("\n**Recently Merged PRs:** " + ", ".join(f"[#{m['number']} - {m['title']}]({m['html_url']})" for m in merged_prs))
+        lines.append("")
+    elif isinstance(prs_data, dict) and prs_data.get("error"):
+        lines.append(f"⚠️ *Pull Requests fetch notice: {prs_data.get('error')}*\n")
+
+    # 2. Issues Section
+    issues_data = raw_res.get("issues")
+    if isinstance(issues_data, dict) and not issues_data.get("error"):
+        open_issues = issues_data.get("open_issues", [])
+        unassigned = issues_data.get("unassigned_issues", [])
+        blockers = issues_data.get("blocker_issues", [])
+
+        lines.append(f"### 🐛 GitHub Issues (Total Open: {len(open_issues)} | Unassigned: {len(unassigned)} | Blockers: {len(blockers)})")
+        if open_issues:
+            lines.append("| # | Issue Title | Author | State | Assignees | Priority / Blocker | Comments | Link |")
+            lines.append("| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |")
+            for iss in open_issues[:15]:
+                assignees = ", ".join(f"@{a}" for a in iss.get("assignees", [])) or "*(Unassigned)*"
+                blocker_badge = "🚨 **Blocker/Bug**" if iss.get("is_blocker") else "Normal"
+                link = f"[Issue #{iss.get('number')}]({iss.get('html_url')})" if iss.get("html_url") else f"#{iss.get('number')}"
+                lines.append(f"| **#{iss.get('number')}** | {iss.get('title')} | @{iss.get('author')} | `{iss.get('state')}` | {assignees} | {blocker_badge} | {iss.get('comments_count', 0)} | {link} |")
+        else:
+            lines.append("No open GitHub issues found.")
+        lines.append("")
+    elif isinstance(issues_data, dict) and issues_data.get("error"):
+        lines.append(f"⚠️ *Issues fetch notice: {issues_data.get('error')}*\n")
+
+    # 3. Contributor Activity Section
+    contrib_data = raw_res.get("contributors")
+    if isinstance(contrib_data, dict) and not contrib_data.get("error"):
+        top_contribs = contrib_data.get("top_contributors", [])
+        recent_commits = contrib_data.get("recent_commits", [])
+        commits_7d = contrib_data.get("commits_last_7_days", 0)
+        total_commits = contrib_data.get("total_commits", 0)
+
+        lines.append(f"### 📈 Developer Velocity & Contributor Activity (Last 14 Days: {total_commits} commits | Last 7 Days: {commits_7d} commits)")
+        if top_contribs:
+            lines.append("| Contributor | Commits (14d) | Recent Activity |")
+            lines.append("| :--- | :--- | :--- |")
+            for c in top_contribs[:6]:
+                last_dt = c.get("last_commit_date", "")[:10] if c.get("last_commit_date") else "Recent"
+                lines.append(f"| **@{c.get('login')}** | {c.get('commit_count')} commits | Last committed {last_dt} |")
+        if recent_commits:
+            lines.append("\n**Recent Commits:**")
+            for rc in recent_commits[:5]:
+                c_link = f"[`{rc.get('sha')}`]({rc.get('html_url')})" if rc.get("html_url") else f"`{rc.get('sha')}`"
+                lines.append(f"- {c_link} {rc.get('message')} (@{rc.get('author')})")
+        lines.append("")
+    elif isinstance(contrib_data, dict) and contrib_data.get("error"):
+        lines.append(f"⚠️ *Contributor activity notice: {contrib_data.get('error')}*\n")
+
+    # 4. Release & CI Status Section
+    ci_data = raw_res.get("release_ci")
+    if isinstance(ci_data, dict) and not ci_data.get("error"):
+        runs = ci_data.get("recent_workflow_runs", [])
+        ci_health = ci_data.get("ci_health", {})
+        latest_rel = ci_data.get("latest_release")
+
+        health_badge = "✅ All Passing" if ci_health.get("is_healthy") else f"⚠️ {ci_health.get('failing_runs', 0)} Failing"
+        lines.append(f"### 🚀 Release & CI/CD Status (Build Health: {health_badge})")
+        if latest_rel:
+            lines.append(f"**Latest Release:** [{latest_rel.get('tagName')} - {latest_rel.get('name')}]({latest_rel.get('htmlUrl')}) (Published: {str(latest_rel.get('publishedAt'))[:10]})")
+        if runs:
+            lines.append("| Workflow Name | Branch | Status | Conclusion | Created | Link |")
+            lines.append("| :--- | :--- | :--- | :--- | :--- | :--- |")
+            for r in runs[:6]:
+                conc = r.get("conclusion") or r.get("status")
+                conc_icon = "✅ success" if conc == "success" else "❌ failure" if conc in ["failure", "timed_out"] else f"⏳ {conc}"
+                r_link = f"[Run #{r.get('id')}]({r.get('htmlUrl')})" if r.get("htmlUrl") else f"#{r.get('id')}"
+                lines.append(f"| **{r.get('name')}** | `{r.get('headBranch')}` | `{r.get('status')}` | {conc_icon} | {str(r.get('createdAt'))[:10]} | {r_link} |")
+        lines.append("")
+    elif isinstance(ci_data, dict) and ci_data.get("error"):
+        lines.append(f"⚠️ *Release & CI fetch notice: {ci_data.get('error')}*\n")
+
+    summary_text = "\n".join(lines)
+
+    return {
+        "_github_messages": [RESET_SENTINEL, {"role": "github", "content": summary_text}],
+        "github_insights": {
+            "owner": owner,
+            "repo": repo,
+            "pull_requests": prs_data if isinstance(prs_data, dict) else {},
+            "issues": issues_data if isinstance(issues_data, dict) else {},
+            "contributors": contrib_data if isinstance(contrib_data, dict) else {},
+            "release_ci": ci_data if isinstance(ci_data, dict) else {},
+        },
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 4. KAYA SYNTHESIZER & DIRECT NODES (Only Kaya streams tokens to user)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1368,11 +1653,12 @@ async def kaya_synthesizer_node(state: SupervisorState, config: RunnableConfig) 
     else:
         deadline_text = "No deadline currently set"
 
-    # Collect findings from all sub-agents (Internal DB + External MCP integrations)
+    # Collect findings from all sub-agents (Internal DB + External MCP + GitHub)
     findings_blocks = []
     for key, label in [
         ("_analyst_messages", "ANALYST FINDINGS"),
         ("_db_write_messages", "DB WRITE ACTIONS"),
+        ("_github_messages", "GITHUB REPOSITORY FINDINGS (PRs, Code Reviews, Contributor Velocity, Release & CI Health)"),
         ("_mcp_messages", "THIRD-PARTY MCP INTEGRATION FINDINGS (Sentry, Jira, Vercel, Slack, Linear, Notion, ETC)"),
     ]:
         msgs = state.get(key, [])
@@ -1450,11 +1736,12 @@ def build_kaya_graph():
     """Builds and compiles the master Kaya multi-agent LangGraph workflow."""
     workflow = StateGraph(SupervisorState)
 
-    # Add Nodes (3 Sub-Agents + Direct + Synthesizer)
+    # Add Nodes (4 Sub-Agents + Direct + Synthesizer)
     workflow.add_node("supervisor_router_node", supervisor_router_node)
     workflow.add_node("kaya_direct_node", kaya_direct_node)
     workflow.add_node("analyst_node", analyst_worker_node)
     workflow.add_node("db_write_node", db_write_worker_node)
+    workflow.add_node("github_node", github_worker_node)
     workflow.add_node("mcp_node", mcp_worker_node)
     workflow.add_node("kaya_synthesizer_node", kaya_synthesizer_node)
 
@@ -1465,7 +1752,7 @@ def build_kaya_graph():
     workflow.add_conditional_edges(
         "supervisor_router_node",
         route_supervisor,
-        ["kaya_direct_node", "analyst_node", "db_write_node", "mcp_node"],
+        ["kaya_direct_node", "analyst_node", "db_write_node", "github_node", "mcp_node"],
     )
 
     # Direct Response terminates directly
@@ -1474,6 +1761,7 @@ def build_kaya_graph():
     # Fan-In: All Sub-Agent Workers converge into Kaya Synthesizer
     workflow.add_edge("analyst_node", "kaya_synthesizer_node")
     workflow.add_edge("db_write_node", "kaya_synthesizer_node")
+    workflow.add_edge("github_node", "kaya_synthesizer_node")
     workflow.add_edge("mcp_node", "kaya_synthesizer_node")
 
     # Synthesizer terminates at END
