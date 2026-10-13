@@ -1,0 +1,9 @@
+{
+  "name": "wekraft-agent",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "python server.py",
+    "start": "python server.py"
+  }
+}
